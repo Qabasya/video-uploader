@@ -270,10 +270,10 @@ groups:
 
 ## CI (GitHub Actions)
 
-- Workflow: `.github/workflows/ci.yml`. Триггеры: `pull_request` в `master` и `push` в `master`.
+- Workflow: `.github/workflows/ci.yml`. Триггеры: `pull_request` в `main` и `push` в `main`.
 - Одна джоба на `ubuntu-latest`, Python 3.12: checkout → официальный `astral-sh/setup-uv` (актуальная мажорная версия, `enable-cache: true`) → `uv sync --frozen` → `uv run ruff format --check .` → `uv run ruff check .` → `uv run mypy src` → `uv run pytest`.
 - Секреты в CI не нужны: тесты не ходят в сеть/S3/LMS (только фейки) — это гарантировано разделом Testing.
-- Мердж в `master` — только при зелёном CI. Branch protection (required status check `ci`) настраивается руками в GitHub: Settings → Branches → правило для `master`.
+- Мердж в `main` — только при зелёном CI. Branch protection (required status check `ci`) настраивается руками в GitHub: Settings → Branches → правило для `main`.
 
 ## Strict Rules
 

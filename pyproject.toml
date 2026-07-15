@@ -1,5 +1,45 @@
 [project]
-name = "video-uploader"
+name = "fs-video-ingest"
 version = "0.1.0"
-requires-python = ">=3.9"
-dependencies = []
+description = "Перенос видеозаписей занятий с SMB-шары в S3 (Beget) и регистрация в LMS (fs-lms)"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.43.48",
+    "fastapi>=0.139.0",
+    "httpx>=0.28.1",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.14.2",
+    "pyyaml>=6.0.3",
+    "uvicorn>=0.51.0",
+]
+
+[project.scripts]
+video-ingest = "video_ingest.main:main"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "video_ingest"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "UP", "B"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.0",
+    "pytest>=9.1.1",
+    "ruff>=0.15.21",
+]
