@@ -1,0 +1,23 @@
+# IDE
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Инструменты разработки
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Секреты и локальные данные сервиса
+.env
+data/
+
+# ОС
+.DS_Store
