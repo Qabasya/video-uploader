@@ -153,7 +153,7 @@ wheels = [
 ]
 
 [[package]]
-name = "fs-video-ingest"
+name = "fs-video-uploader"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

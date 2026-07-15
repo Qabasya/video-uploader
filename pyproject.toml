@@ -1,5 +1,5 @@
 [project]
-name = "fs-video-ingest"
+name = "fs-video-uploader"
 version = "0.1.0"
 description = "Перенос видеозаписей занятий с SMB-шары в S3 (Beget) и регистрация в LMS (fs-lms)"
 requires-python = ">=3.12"
@@ -14,14 +14,14 @@ dependencies = [
 ]
 
 [project.scripts]
-video-ingest = "video_ingest.main:main"
+video-uploader = "video_uploader.main:main"
 
 [build-system]
 requires = ["uv_build>=0.11,<0.12"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-module-name = "video_ingest"
+module-name = "video_uploader"
 
 [tool.ruff]
 line-length = 100

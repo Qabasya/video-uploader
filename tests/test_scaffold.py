@@ -4,41 +4,41 @@ import importlib
 
 import pytest
 
-import video_ingest
-from video_ingest.main import main
+import video_uploader
+from video_uploader.main import main
 
 MODULES = [
-    "video_ingest",
-    "video_ingest.api",
-    "video_ingest.api.app",
-    "video_ingest.config",
-    "video_ingest.domain",
-    "video_ingest.domain.events",
-    "video_ingest.domain.models",
-    "video_ingest.lms",
-    "video_ingest.lms.client",
-    "video_ingest.logging_setup",
-    "video_ingest.logging_setup.factory",
-    "video_ingest.logging_setup.loki",
-    "video_ingest.logging_setup.telegram",
-    "video_ingest.main",
-    "video_ingest.metadata",
-    "video_ingest.metadata.base",
-    "video_ingest.metadata.filename",
-    "video_ingest.metadata.filestat",
-    "video_ingest.notifications",
-    "video_ingest.notifications.telegram",
-    "video_ingest.pipeline",
-    "video_ingest.resolving",
-    "video_ingest.resolving.resolver",
-    "video_ingest.scanner",
-    "video_ingest.scanner.scanner",
-    "video_ingest.scanner.stability",
-    "video_ingest.state",
-    "video_ingest.state.repository",
-    "video_ingest.storage",
-    "video_ingest.storage.key_builder",
-    "video_ingest.storage.s3_gateway",
+    "video_uploader",
+    "video_uploader.api",
+    "video_uploader.api.app",
+    "video_uploader.config",
+    "video_uploader.domain",
+    "video_uploader.domain.events",
+    "video_uploader.domain.models",
+    "video_uploader.lms",
+    "video_uploader.lms.client",
+    "video_uploader.logging_setup",
+    "video_uploader.logging_setup.factory",
+    "video_uploader.logging_setup.loki",
+    "video_uploader.logging_setup.telegram",
+    "video_uploader.main",
+    "video_uploader.metadata",
+    "video_uploader.metadata.base",
+    "video_uploader.metadata.filename",
+    "video_uploader.metadata.filestat",
+    "video_uploader.notifications",
+    "video_uploader.notifications.telegram",
+    "video_uploader.pipeline",
+    "video_uploader.resolving",
+    "video_uploader.resolving.resolver",
+    "video_uploader.scanner",
+    "video_uploader.scanner.scanner",
+    "video_uploader.scanner.stability",
+    "video_uploader.state",
+    "video_uploader.state.repository",
+    "video_uploader.storage",
+    "video_uploader.storage.key_builder",
+    "video_uploader.storage.s3_gateway",
 ]
 
 
@@ -50,7 +50,7 @@ def test_module_imports(module_name: str) -> None:
 
 def test_version() -> None:
     """Версия пакета задана и совпадает с pyproject."""
-    assert video_ingest.__version__ == "0.1.0"
+    assert video_uploader.__version__ == "0.1.0"
 
 
 def test_entry_point_stub() -> None:

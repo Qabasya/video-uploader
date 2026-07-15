@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`fs-video-ingest` — фоновый сервис, который переносит видеозаписи занятий с SMB-шары учебного центра в S3-хранилище Beget и регистрирует их в LMS (WordPress-плагин `fs-lms`).
+`fs-video-uploader` — фоновый сервис, который переносит видеозаписи занятий с SMB-шары учебного центра в S3-хранилище Beget и регистрирует их в LMS (WordPress-плагин `fs-lms`).
 
 Контекст среды:
 
@@ -26,7 +26,7 @@ scan → stability → dedup (реестр) → metadata (дата) → resolve 
 
 ```bash
 uv sync                          # окружение + зависимости (включая dev)
-uv run video-ingest              # локальный запуск сервиса
+uv run video-uploader              # локальный запуск сервиса
 uv run pytest                    # тесты
 uv run ruff format .             # автоформат (PEP 8)
 uv run ruff check --fix .        # линт
@@ -48,7 +48,8 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 - Python 3.12+, менеджер — **uv** (`pyproject.toml` + `uv.lock`, src-layout)
 - pydantic v2 + pydantic-settings — конфиг и внешние DTO с валидацией
 - boto3 — S3 (Beget); httpx — LMS REST / Telegram / Loki
-- sqlite3 (stdlib) — реестр состояния; **без ORM**
+- sqlite3 (stdlib) — реестр состояния; 
+- ORM SQLAlchemy 2.0
 - PyYAML — `config/groups.yaml`
 - FastAPI + uvicorn — тонкий HTTP-слой (`/health`, `/status`, `/rescan`)
 - dev: pytest, ruff, mypy
@@ -60,7 +61,7 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 - ООП: логика в классах, зависимости — через конструктор; интерфейсы — `typing.Protocol` в `base.py` соответствующего пакета
 - Доменные модели — frozen `dataclass(slots=True)`; конфиг и внешние DTO — pydantic
 - Пути — только `pathlib.Path`
-- `print` запрещён — только `logging` (логгеры `video_ingest.<module>`)
+- `print` запрещён — только `logging` (логгеры `video_uploader.<module>`)
 - Docstrings (Google style) на публичных классах и методах
 - Никакого глобального изменяемого состояния и синглтонов; вся сборка зависимостей — в composition root (`main.py`)
 
@@ -74,7 +75,7 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 
 ## Architecture
 
-| Модуль (`src/video_ingest/`) | Роль |
+| Модуль (`src/video_uploader/`) | Роль |
 |---|---|
 | `main.py` | Composition root: конфиг → сборка зависимостей → воркер (фоновый поток) + uvicorn; graceful shutdown по SIGTERM |
 | `config.py` | `Settings` (pydantic-settings; источник — env/`.env`) |
@@ -136,7 +137,7 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
   "size_bytes": 123456789,
   "sha256": "…",
   "uploaded_at": "2026-07-14T21:00:05+00:00",
-  "service": {"name": "fs-video-ingest", "version": "0.1.0"}
+  "service": {"name": "fs-video-uploader", "version": "0.1.0"}
 }
 ```
 
@@ -148,7 +149,7 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 
 ```
 POST {LMS_BASE_URL}/wp-json/fs-lms/v1/videos
-Header: X-FS-Ingest-Token: {LMS_INGEST_TOKEN}
+Header: X-FS-uploader-Token: {LMS_uploader_TOKEN}
 ```
 
 ```json
@@ -206,7 +207,7 @@ groups:
 ## Logging & Notifications
 
 - Только stdlib `logging`; хендлеры собирает `logging_setup/factory.py` из `Settings`:
-  - file — `RotatingFileHandler` `DATA_DIR/logs/ingest.log` (10 MiB × 5), всегда включён;
+  - file — `RotatingFileHandler` `DATA_DIR/logs/uploader.log` (10 MiB × 5), всегда включён;
   - loki — HTTP push (`/loki/api/v1/push`), включается при заданном `LOKI_URL`;
   - telegram — только `ERROR`+, включается при `TELEGRAM_*`; защита от флуда (одинаковый текст не чаще 1 раза в 30 с).
 - Бизнес-уведомления (успешная загрузка, финальный сбой) — это **не логи**: их шлют подписчики EventBus из `notifications/` тем же Telegram Bot API через httpx.
@@ -215,30 +216,30 @@ groups:
 
 `.env` → pydantic-settings. Секреты — только через env; `.env` в `.gitignore`; `.env.example` поддерживать актуальным.
 
-| Переменная | Default | Назначение |
-|---|---|---|
-| `VIDEO_ROOT` | `/mnt/video` | Корень смонтированной шары |
-| `DATA_DIR` | `/data` | state.db + логи |
-| `GROUPS_FILE` | `/app/config/groups.yaml` | Маппинг групп |
-| `SCAN_INTERVAL_SECONDS` | `300` | Период опроса |
-| `STABILITY_MINUTES` | `5` | Порог «файл дописан» |
-| `ALLOWED_EXTENSIONS` | `.webm` | Кандидаты (при необходимости расширить) |
-| `DATE_REGEX` | под Телемост | Именованные группы `day/month/year/hour/minute/second` (см. Processing Rules) |
-| `SKIP_OLDER_THAN_DAYS` | — | Пропуск залежей (пусто = выкл) |
-| `ARCHIVE_AFTER_REGISTER` | `true` | Перемещать исходник в архив после регистрации |
-| `ARCHIVE_SUBDIR` | `_uploaded` | Имя архивной подпапки внутри папки группы |
-| `MAX_ATTEMPTS` | `5` | Ретраи на файл |
-| `TZ_NAME` | `Europe/Moscow` | TZ для `recorded_at` |
-| `S3_ENDPOINT_URL` | `https://s3.ru1.storage.beget.cloud` | Beget S3 |
-| `S3_REGION` | `ru-1` | Для SigV4 |
+| Переменная                                    | Default | Назначение |
+|-----------------------------------------------|---|---|
+| `VIDEO_ROOT`                                  | `/mnt/video` | Корень смонтированной шары |
+| `DATA_DIR`                                    | `/data` | state.db + логи |
+| `GROUPS_FILE`                                 | `/app/config/groups.yaml` | Маппинг групп |
+| `SCAN_INTERVAL_SECONDS`                       | `300` | Период опроса |
+| `STABILITY_MINUTES`                           | `5` | Порог «файл дописан» |
+| `ALLOWED_EXTENSIONS`                          | `.webm` | Кандидаты (при необходимости расширить) |
+| `DATE_REGEX`                                  | под Телемост | Именованные группы `day/month/year/hour/minute/second` (см. Processing Rules) |
+| `SKIP_OLDER_THAN_DAYS`                        | — | Пропуск залежей (пусто = выкл) |
+| `ARCHIVE_AFTER_REGISTER`                      | `true` | Перемещать исходник в архив после регистрации |
+| `ARCHIVE_SUBDIR`                              | `_uploaded` | Имя архивной подпапки внутри папки группы |
+| `MAX_ATTEMPTS`                                | `5` | Ретраи на файл |
+| `TZ_NAME`                                     | `Europe/Moscow` | TZ для `recorded_at` |
+| `S3_ENDPOINT_URL`                             | `https://s3.ru1.storage.beget.cloud` | Beget S3 |
+| `S3_REGION`                                   | `ru-1` | Для SigV4 |
 | `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` | — | Реквизиты Beget |
-| `S3_KEY_PREFIX` | `videos` | Префикс ключей |
-| `LMS_BASE_URL` | — | Напр. `http://11.11.11.20:8080` |
-| `LMS_INGEST_TOKEN` | — | Shared secret |
-| `LMS_DRY_RUN` | `false` | Регистрация «вхолостую» до готовности эндпоинта |
-| `LOKI_URL` | — | Опция |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | — | Опция |
-| `API_PORT` | `8090` | FastAPI |
+| `S3_KEY_PREFIX`                               | `videos` | Префикс ключей |
+| `LMS_BASE_URL`                                | — | Напр. `http://11.11.11.20:8080` |
+| `LMS_UPLOADER_TOKEN`                          | — | Shared secret |
+| `LMS_DRY_RUN`                                 | `false` | Регистрация «вхолостую» до готовности эндпоинта |
+| `LOKI_URL`                                    | — | Опция |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`      | — | Опция |
+| `API_PORT`                                    | `8090` | FastAPI |
 
 ## HTTP API
 
