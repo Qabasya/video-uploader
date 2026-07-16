@@ -542,3 +542,128 @@ class LmsClient:
 - [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 176/176 тестов.
 - [x] Ревью Claude пройдено (код и тесты написаны Claude по вашей просьбе).
 - [ ] Коммит — на вашей стороне.
+
+---
+
+## Этап 8 — Pipeline (оркестратор) ← ТЕКУЩИЙ
+
+**Цель:** `pipeline.py` — единственное место, которое видит весь путь файла целиком: от `scan()` до перемещения в архив, склеивая scanner (4), stability (4), metadata+resolver (5), state repository (3), S3Gateway+KeyBuilder (6), LmsClient (7) и `EventBus` (2.4). Это самый большой этап — 14 решений ниже, часть из них нетривиальна и меняет уже написанный код этапа 3. **Прошу явно подтвердить решения 1, 2 и 9 — они не следуют напрямую из CLAUDE.md, это моя интерпретация того, как должен вести себя пайплайн при повторных циклах и сбоях.**
+
+**Затрагиваемые файлы:** `video_uploader/pipeline.py`, `video_uploader/state/repository.py` (точечное изменение таблицы переходов, решение 2), `tests/test_pipeline.py`.
+
+### Порядок шагов (напоминание из CLAUDE.md)
+
+```
+scan → stability → dedup (реестр) → metadata (дата) → resolve (группа → slug + lms)
+     → upload (S3) → verify → register (LMS REST) → cleanup (архив)
+```
+
+### Решения, принятые в постановке
+
+1. **✅ Подтверждено. `run_cycle()` живёт в `Pipeline`, не в `main.py`.** Архитектурная таблица CLAUDE.md называет `pipeline.py` «оркестратором шагов обработки одного файла» — формально это про шаги *внутри* одного файла. Но `GroupUnmapped` должен публиковаться «не чаще раза за цикл на папку» (CLAUDE.md), а «цикл» — это понятие уровня *всех* файлов разом, и его должен где-то хранить объект, который переживает несколько вызовов `process()`. Предлагаю: `Pipeline.run_cycle()` сам вызывает `scanner.scan()`, заводит `set()` уже предупреждённых папок на время цикла и последовательно обрабатывает каждый файл с изоляцией ошибок. `main.py` (этап 10) просто дёргает `run_cycle()` по таймеру `SCAN_INTERVAL_SECONDS`. Альтернатива — вынести цикл и `set()` в `main.py`, а `Pipeline.process_one(video_file, warned_folders)` принимать это множество аргументом; мне вариант с `run_cycle()` внутри `Pipeline` кажется чище (меньше протекающих деталей наружу), но это ваш вызов.
+
+2. **✅ Подтверждено** (папки — те, что `Sync-VideoGroups.ps1` создаёт из `video-groups.csv` до того, как вы синхронно обновите `groups.yaml`; переоткрытие даёт файлу шанс обработаться после закрытия дыры в конфиге, без ручного вмешательства в реестр). Точечное изменение `_ALLOWED_TRANSITIONS` в `state/repository.py`. Сейчас (этап 3) `"skipped_unmapped": frozenset()` — терминально навсегда. Но если админ *добавит* пропущенную папку в `groups.yaml` уже после того, как файлы в ней успели схватить `skipped_unmapped`, они должны получить шанс обработаться на следующих циклах, а не зависнуть навечно. Меняю на `"skipped_unmapped": frozenset({"uploading"})`. `"skipped_old"` **не трогаю** — оставляю терминальным: старение файла необратимо (время не идёт назад), в отличие от дыры в конфиге, которую можно исправить. Если считаете, что `skipped_old` тоже должен быть переоткрываемым (например, если админ увеличит `SKIP_OLDER_THAN_DAYS`) — скажите, добавлю симметрично.
+3. **Протоколы `UploadGateway`/`RegistrationClient` объявляются прямо в `pipeline.py`**, не в новых файлах `storage/base.py`/`lms/base.py`. Это узкие интерфейсы (SOLID-I) ровно из тех методов, которые пайплайн реально вызывает у `S3Gateway`/`LmsClient` — сами классы им уже соответствуют структурно (Python Protocol, `S3Gateway`/`LmsClient` не нужно ничего наследовать). Место объявления — у потребителя, а не у поставщика: так Architecture-таблица CLAUDE.md (там нет строк `storage/base.py`/`lms/base.py`) не нарушается, а требование SOLID-D («pipeline зависит только от Protocol») выполняется.
+   ```python
+   class UploadGateway(Protocol):
+       def upload_video(self, path: Path, key: str, metadata: Mapping[str, str]) -> None: ...
+       def put_manifest(self, key: str, manifest: dict[str, object]) -> None: ...
+       def verify(self, key: str, expected_size: int) -> bool: ...
+
+   class RegistrationClient(Protocol):
+       def register(self, payload: dict[str, object]) -> None: ...
+   ```
+   `StateRepository` за Protocol не прячем — раздел Testing CLAUDE.md явно говорит, что для пайплайна нужны `FakeS3Gateway`, `FakeLmsClient`, но реестр — «на tmp SQLite» (настоящий репозиторий). Сканер/`StabilityChecker`/`GroupResolver` — туда же, без фейков, настоящие объекты на `tmp_path`/собранном в тесте `GroupsConfig`.
+4. **`sha256` считается прямо в `pipeline.py`** (этап 6 сознательно это не взял на себя, этап 3 дал только кэш). Поток по 1 MiB, как того требует CLAUDE.md: `hashlib.sha256()` + `while chunk := f.read(1024*1024): hasher.update(chunk)`. Модульная функция `_compute_sha256(path) -> str`, не метод — не нужен `self`.
+5. **Сборка `metadata`-словаря для `x-amz-meta-*`, JSON-манифеста и REST-payload — тоже здесь**, как и было обещано на этапах 6–7 (там я сознательно вывел это за скобки). Три отдельные модульные функции: `_build_object_metadata(lesson, sha256) -> dict[str, str]`, `_build_manifest(video_file, lesson, sha256, s3_key, uploaded_at) -> dict[str, object]`, `_build_lms_payload(...) -> dict[str, object]`. Ключи `lms`-блока для `x-amz-meta-lms-*` — маппинг `_` → `-` (`teacher_id` → `lms-teacher-id`), как требует CLAUDE.md.
+6. **Даты — сериализация через `.isoformat()`**: tz-aware `datetime` сам даёт `2026-07-08T16:04:45+03:00` (для `recorded_at`) и `...+00:00` (для `uploaded_at` в UTC) — ровно формат из примеров CLAUDE.md, без ручной сборки строки.
+7. **Стратегии даты — упорядоченный список, перебор до первого успеха**, не хардкод «сначала имя файла, потом mtime» по именам классов: `date_extractors: Sequence[DateExtractor]` в конструкторе (Strategy, SOLID-O — новая стратегия добавляется без правки `pipeline.py`). `date_from_fallback = (индекс сработавшей стратегии > 0)` — обобщается корректно на любое число стратегий, а не только на ровно две.
+8. **`SKIP_OLDER_THAN_DAYS` сравнивается с `recorded_at`**, не с `mtime`: семантически это «пропустить старые *занятия*», а дата занятия — результат шага metadata, не сырой атрибут файла. Проверка идёт сразу после определения даты, до resolve (нет смысла резолвить группу файлу, который всё равно пропустим).
+9. **✅ Подтверждено. Возобновление после падения процесса — «не звать mark_\*, если запись уже в этом статусе».** Если сервис упадёт (SIGKILL, OOM, перезапуск контейнера) между `mark_uploading` и `mark_uploaded`, запись останется в статусе `uploading` без исключения, поймавшего это в `mark_failed`. На следующем цикле файл снова найдётся сканером, дойдёт до шага upload — и попытка повторно вызвать `mark_uploading` из статуса `uploading` упадёт `InvalidTransitionError` (в таблице переходов `"uploading"` нет самого себя как допустимой цели). Решение: каждый `mark_*`-вызов в pipeline предваряется проверкой `if current_status != "<целевой>"` — если запись уже там, где нужно, просто не вызываем репозиторий повторно, а используем уже сохранённые данные (`s3_key` из записи, если статус уже `uploaded`+ — тогда даже сам upload на S3 повторно не делаем, сразу verify). Если статус `uploading` (не дошли до `uploaded`) — upload на S3 повторяем (он идемпотентен, просто перезапишет тот же ключ), а вот `mark_uploading` — нет. Это не следует из CLAUDE.md напрямую, а закрывает дыру, которую я нашёл, продумывая этот этап — если считаете это избыточным для MVP, могу упростить до «просто дать упасть в failed и ретраить с нуля», но тогда придётся расширить таблицу переходов (`uploading`→`uploading`), что противоречит решению 2 (минимальные изменения `state/repository.py`).
+10. **Идемпотентность по контенту (дедуп)** — сразу после получения `sha256` (свой, посчитанный или взятый из кэша), проверяем `repo.get_by_sha256(sha256)`: если нашли **чужую** запись (другой `id`) в статусе `registered`/`archived` — переиспользуем её `s3_key`, проходим `mark_uploading → mark_uploaded(тем же s3_key) → mark_registered` без единого сетевого вызова к S3/LMS, и сразу переходим к cleanup. Этот шорткат применяется только если *своя* запись ещё не начинала аплоад (`discovered`/`failed`/`skipped_unmapped`) — если она уже в `uploading`/`uploaded`, идём её собственным путём (решение 9), не запутываем два процесса.
+11. **`GroupUnmapped` и повторный `mark_skipped`** — не публикуем событие повторно в рамках *одного* цикла для той же папки (`set()` из решения 1); `mark_skipped(file_id, "skipped_unmapped")` тоже не дёргаем, если запись уже в этом статусе (решение 9, тот же принцип).
+12. **`DRY_RUN` не проникает в pipeline, кроме одного места — архивации.** `S3Gateway`/`LmsClient` подменяются на dry-run-реализации в composition root (этап 10, уже решили на этапах 6–7) — пайплайн зовёт их как обычно и даже проводит запись через `uploaded`/`registered` по-настоящему («шаг register логируется и считается успешным» — CLAUDE.md). Но у архивации нет отдельного inject-объекта (это просто `Path.rename`), поэтому единственная ветка `if self._dry_run` во всём файле — вокруг фактического перемещения файла: событие и статус `archived` в дневном режиме всё равно не проставляются (файл физически не тронут, значит и `mark_archived` вызывать нечего — иначе реестр окажется рассинхронизирован с диском).
+13. **Cleanup не требует ни `group_slug`, ни `recorded_at`** — это чисто файловая операция `video_file.path.parent / ARCHIVE_SUBDIR`, `rename()` в пределах той же шары (сервер сам делает это без копирования — обычное поведение `Path.rename` на одном mount). При коллизии имени — суффикс `_{sha8}` к имени (не к расширению).
+14. **Изоляция ошибок — на уровне `run_cycle()`**, оборачивает вызов обработки каждого файла; `file_id` получаем через `discover()` *до* захода в `try`, чтобы `except` мог записать `mark_failed` даже если упал произвольный более поздний шаг. Если падает сам `discover()` (маловероятно, локальная SQLite) — это уходит выше по стеку без записи в реестр (писать некуда), но не останавливает цикл — `run_cycle()` ловит вообще любое исключение per-file на самом верхнем уровне тоже.
+
+### 8.1 Протоколы и модульные хелперы
+
+- [x] `UploadGateway`, `RegistrationClient` (Protocol) — решение 3.
+- [x] `_compute_sha256(path: Path) -> str` — потоково, чанк 1 MiB.
+- [x] `_build_object_metadata(lesson: LessonMeta, sha256: str) -> dict[str, str]` — `group-slug`, `recorded-at` (`.isoformat()`), `sha256`, `lms-<key>` на каждую пару `lesson.lms` (`_` → `-`).
+- [x] `_build_manifest(video_file, lesson, sha256, uploaded_at) -> dict[str, object]` — schema 2, все поля примера CLAUDE.md. Без параметра `s3_key`: в самом манифесте свой ключ не упоминается (манифест уже лежит под этим ключом + `.json`), убрал неиспользуемый параметр из исходной постановки.
+- [x] `_build_lms_payload(bucket, s3_key, manifest_key, lesson, video_file, sha256) -> dict[str, object]` — `duration_sec: None`.
+
+### 8.2 `Pipeline.__init__`
+
+Зависимости через конструктор (композиция — этап 10): `scanner: VideoScanner`, `stability: StabilityChecker`, `repo: StateRepository`, `date_extractors: Sequence[DateExtractor]`, `resolver: GroupResolver`, `key_builder: KeyBuilder`, `s3: UploadGateway`, `lms: RegistrationClient`, `events: EventBus`, `bucket: str`, `archive_subdir: str`, `archive_after_register: bool`, `max_attempts: int`, `skip_older_than_days: int | None`, `dry_run: bool`. Да, параметров много — это ожидаемо для оркестратора, который единолично склеивает всё; не пытаюсь притворно упаковывать их в один объект-конфиг без вашей просьбы.
+
+### 8.3 `run_cycle()`
+
+- [x] `warned_folders: set[str] = set()` — локальная переменная на время вызова.
+- [x] `for video_file in self._scanner.scan():`.
+- [x] Два вложенных `try`: внешний вокруг `discover()` (если падает — `logger.exception` + `continue`, писать в реестр уже некуда), внутренний вокруг `self._process(...)` с двумя `except` — `LmsRejectedError` (permanent=True) первым, затем общий `Exception` (permanent=False). Более специфичный `except` обязан идти раньше общего.
+
+### 8.4 `_process(file_id, video_file, warned_folders)` — алгоритм
+
+Реализовано по алгоритму постановки, с одним найденным на тестах уточнением к шагу 11 (см. ниже).
+
+1. [x] `state = repo.get_by_id(file_id)` (сам `discover()` уже выполнен в `run_cycle()`).
+2. [x] Ранние выходы: `{"archived", "skipped_old"}` → `return`; `"failed"` с исчерпанными попытками → `return`.
+3. [x] `"registered"` → сразу `_cleanup(file_id, video_file, state.sha256)`, `return`.
+4. [x] `is_stable()` → `False` → `return`, не ошибка.
+5. [x] `_resolve_sha256`: кэш реестра либо потоковый подсчёт + `set_sha256`.
+6. [x] Дедуп по контенту — только для `_DEDUP_ELIGIBLE_STATUSES = ("discovered", "failed", "skipped_unmapped")`.
+7. [x] `_extract_date`: перебор `date_extractors`, `date_from_fallback = (индекс > 0)`; событие `DateFallback`.
+8. [x] `SKIP_OLDER_THAN_DAYS` от `recorded_at` → `mark_skipped(..., "skipped_old")`, `return`.
+9. [x] `resolve()` → `None`: `GroupUnmapped` (не чаще раза за папку), `mark_skipped(..., "skipped_unmapped")` если ещё не в этом статусе, `return`.
+10. [x] Собрать `LessonMeta`.
+11. [x] **⚠️ Уточнение к постановке, найдено на тестах.** Условие входа в upload-блок — `state.s3_key is None`, **не** `state.status != "uploaded"`. Причина: если упасть на *более позднем* шаге (verify/register/cleanup), `mark_failed` перезатирает `status` на `"failed"`, а `s3_key` остаётся сохранённым — только `s3_key` надёжно говорит «загрузка уже случилась». Дальше: если `s3_key` уже есть, а `status == "failed"` (упало позже upload) — технически восстанавливаем `uploading → uploaded` (без сети) перед тем, как `mark_registered` увидит допустимый переход из `uploaded`, а не из `failed` (которого таблица переходов не разрешает напрямую в `registered`).
+12. [x] `verify()` → `False` → `raise RuntimeError(...)`.
+13. [x] Register-блок (`if state.status != "registered"`) — регистрация в LMS дешёвая и явно идемпотентна по контракту (upsert по `s3_key`), поэтому в отличие от upload не нужен отдельный «надёжный сигнал» — проверки по `status` достаточно.
+14. [x] `_cleanup(file_id, video_file, sha256)`.
+
+### 8.5 `_cleanup(file_id, video_file, sha256)`
+
+Сигнатура упрощена относительно постановки — принимает `sha256: str` напрямую, не весь `FileState` (только это поле и нужно для суффикса коллизии).
+
+- [x] `not archive_after_register` → `return`.
+- [x] `dry_run` → `logger.info(...)`, `return` без изменений в БД/на диске.
+- [x] `archive_dir = video_file.path.parent / archive_subdir`; `mkdir(exist_ok=True)`.
+- [x] Коллизия имени → `_{sha256[:8]}` перед расширением.
+- [x] `rename()` → `mark_archived` → событие `VideoArchived`.
+
+### 8.6 Обработка ошибок в `run_cycle()` (метод `_fail`)
+
+- [x] `logger.exception(...)`, `mark_failed(file_id, str(exc))`.
+- [x] `permanent=True` (для `LmsRejectedError`) — крутит `mark_failed` в цикле, наращивая локальный счётчик `attempts` (не перечитывая БД на каждой итерации — `mark_failed` детерминированно инкрементирует на 1), пока не достигнет `max_attempts`; таблица переходов уже разрешала `failed → failed` с этапа 3, менять ничего не пришлось. Это и есть решение открытого пункта постановки про «4xx без ретраев» — вариант (а).
+- [x] `attempts == max_attempts` (строгое равенство) → событие `VideoFailed` публикуется ровно один раз, на пересечении порога.
+
+### 8.7 Тесты (`tests/test_pipeline.py`)
+
+Фейки: `FakeS3Gateway`, `FakeLmsClient` (структурно реализуют `UploadGateway`/`RegistrationClient`). `StateRepository` — настоящий, на `tmp_path`. Сканер/`StabilityChecker`/`GroupResolver` — настоящие. 15 тестов, все прошли после исправления двух багов (см. ниже).
+
+- [x] **Happy path** — до `archived`; события по одному разу; проверен ключ S3, `x-amz-meta-*`, REST-payload (`s3_bucket`, `group_slug`, `duration_sec is None`).
+- [x] **Нестабильный файл** — остаётся `discovered`, upload не вызван.
+- [x] **`GroupUnmapped` не чаще раза за цикл** — два файла одной незамапленной папки в одном `run_cycle()` → событие один раз, обе записи `skipped_unmapped`.
+- [x] **`skipped_unmapped` → переоткрытие** — после добавления группы в конфиг следующий `run_cycle()` доводит до `archived`.
+- [x] **`SKIP_OLDER_THAN_DAYS`** — `skipped_old`, upload не вызван.
+- [x] **`DateFallback`** — событие опубликовано, дата из `mtime` дошла до манифеста.
+- [x] **Verify fail** — `failed`, `attempts == 1`, register не вызван.
+- [x] **Upload fail** — `failed`, `attempts == 1`.
+- [x] **Register 5xx (retryable)** — `failed` после первого цикла; на втором (ошибка снята) — `archived`, **`upload_video` вызван ровно 1 раз за оба цикла** (найденный баг №1, см. DoD).
+- [x] **Register 4xx (rejected)** — `attempts` сразу выставлены в `max_attempts` (не растут по одному за цикл), `VideoFailed` опубликован один раз, следующий `run_cycle()` файл не трогает вовсе.
+- [x] **Дедуп по контенту** — второй файл с тем же содержимым архивируется с тем же `s3_key`, без вызовов `upload_video`/`put_manifest`/`register`.
+- [x] **Возобновление из `uploading`** — статус выставлен вручную через репозиторий (симуляция крэша) без `s3_key`, `run_cycle()` не падает на `InvalidTransitionError`, доходит до `archived`.
+- [x] **`ARCHIVE_AFTER_REGISTER=false`** — остаётся `registered` на диске, `VideoArchived` не публикуется.
+- [x] **`DRY_RUN=true`** — архивация пропущена, статус остаётся `registered`, файл на месте.
+- [x] **`MAX_ATTEMPTS` исчерпаны** — `VideoFailed` публикуется один раз за 3 цикла падений, четвёртый цикл файл не трогает (`upload_calls` не растёт).
+
+### Definition of Done (этап 8)
+
+- [x] Решения 1, 2, 9 подтверждены вами.
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 191/191 тестов.
+- [x] Ревью Claude пройдено. Найдено и исправлено два реальных бага при написании тестов:
+  1. **`pipeline.py`** — `mark_registered` мог упасть `InvalidTransitionError` при ретрае после падения именно на шаге `register` (не `upload`): `mark_failed` перезатирал статус `uploaded → failed`, а таблица переходов не пускает `failed → registered` напрямую. Исправлено: если `s3_key` уже есть, а текущий статус `failed` — сначала технически восстанавливаем `uploaded` (`mark_uploading` + `mark_uploaded`, без единого сетевого вызова), только потом `mark_registered`.
+  2. **`tests/test_pipeline.py`** — в `FakeS3Gateway.upload_video` вызов записывался в `upload_calls` *после* проверки на ошибку, из-за чего падающие попытки не попадали в счётчик. Поменял порядок: сначала фиксируем вызов, потом решаем, бросать исключение или нет.
+- [ ] Коммит — на вашей стороне.

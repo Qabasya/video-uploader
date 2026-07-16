@@ -271,7 +271,7 @@ groups:
 ## CI (GitHub Actions)
 
 - Workflow: `.github/workflows/ci.yml`. Триггеры: `pull_request` в `main` и `push` в `main`.
-- Одна джоба на `ubuntu-latest`, Python 3.12: checkout → официальный `astral-sh/setup-uv` (актуальная мажорная версия, `enable-cache: true`) → `uv sync --frozen` → `uv run ruff format --check .` → `uv run ruff check .` → `uv run mypy video_uploader` → `uv run pytest`.
+- Одна джоба на `ubuntu-latest`, Python 3.12: checkout → официальный `astral-sh/setup-uv`, приколот к конкретной неизменяемой версии тега (с `v8.0.0` `astral-sh` не публикует плавающие мажорные теги вроде `@v8` — только полные версии, `@v8.3.2` и т.п.; обновлять вручную по мере выхода новых версий), `enable-cache: true` → `uv sync --frozen` → `uv run ruff format --check .` → `uv run ruff check .` → `uv run mypy video_uploader` → `uv run pytest`.
 - Секреты в CI не нужны: тесты не ходят в сеть/S3/LMS (только фейки) — это гарантировано разделом Testing.
 - Мердж в `main` — только при зелёном CI. Branch protection (required status check `ci`) настраивается руками в GitHub: Settings → Branches → правило для `main`.
 
