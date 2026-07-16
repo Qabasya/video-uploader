@@ -469,3 +469,76 @@ class S3Gateway:
 - [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 163/163 тестов.
 - [x] Ревью Claude пройдено (код и тесты написаны Claude по вашей просьбе).
 - [ ] Коммит — на вашей стороне.
+
+---
+
+## Этап 7 — LMS REST-клиент (LmsClient) ← ТЕКУЩИЙ
+
+**Цель:** `LmsClient` — тонкий adapter над `httpx` для `POST /wp-json/fs-lms/v1/videos`: один HTTP-запрос за вызов, интерпретация ответа в понятную для пайплайна классификацию (успех / повторить позже / отвергнуто окончательно). Ретраи «в следующих циклах», сборка payload из доменных моделей и `DRY_RUN` — не сюда, см. решения 1–3.
+
+**Затрагиваемые файлы:** `video_uploader/lms/client.py`, `tests/lms/test_client.py`.
+
+**Внешняя зависимость, не блокирующая этот этап:** `Settings.lms_uploader_token` вы сознательно не добавили на этапе 2.1 (отложенный пункт). `LmsClient` от этого не зависит — конструктор принимает обычный `token: str`, а откуда он берётся (когда добавите поле в `Settings`) — забота composition root на этапе 10.
+
+### Решения, принятые в постановке (обсуждаем, если не согласны)
+
+1. **Ретраи — не здесь.** «5xx и сетевые ошибки → ретраи с экспоненциальным backoff в следующих циклах» — это ретраи *между циклами сканирования* через `StateRepository`/`MAX_ATTEMPTS`, то есть работа `pipeline.py` (этап 8), не цикл повторов внутри одного вызова `register()`. `LmsClient` делает ровно одну попытку HTTP-запроса за вызов.
+2. **Классификация ответа — через типизированные исключения, не через возвращаемый код/enum**: успех — тихий `return`; 5xx и сетевые ошибки (`httpx.HTTPError`) — `LmsRetryableError`; прочие 4xx — `LmsRejectedError` (оба — подклассы `LmsRegistrationError`). Так `pipeline.py` на этапе 8 сможет `except LmsRetryableError` (ретраить, пока `attempts < MAX_ATTEMPTS`) и `except LmsRejectedError` (сразу `failed`, без ретраев — именно это отдельно требует CLAUDE.md для «прочих 4xx») раздельно, без парсинга кода ответа заново.
+3. **`register()` принимает уже готовый payload-словарь** (`dict[str, object]`), не отдельные `LessonMeta`/`UploadResult`/`sha256` аргументы — тот же принцип, что и у `S3Gateway.put_manifest()` на этапе 6: клиент не знает про домен, просто сериализует и шлёт то, что дали. Сборка payload по контракту (`s3_bucket`, `s3_key`, `group_slug`, `lms`, `recorded_at`, `duration_sec: null`, …) — этап 8. **Подтверждено вами.**
+4. **`DRY_RUN` — не в `LmsClient`.** Несмотря на то, что в текущей заглушке-докстринге упомянут «dry-run», по аналогии с `S3Gateway` (этап 6, тоже не занимался `DRY_RUN`) это решение вынесено в composition root на этапе 10: при `DRY_RUN=true` там будет подключаться другая реализация (или клиент вообще не будет вызываться, а шаг сразу будет логироваться как успешный) — сам `LmsClient` всегда делает настоящий HTTP-запрос, никакой ветки `if self._dry_run` внутри него не будет.
+5. **Успех — строго `{200, 201}`**, не любой код `< 300`: CLAUDE.md называет ровно эти два кода; если однажды плагин ответит, скажем, `204`, лучше явно увидеть непонятную классификацию в тесте/логе, чем молча посчитать успехом что-то не описанное в контракте.
+6. **`LmsClient` владеет своим `httpx.Client`** (создаётся в конструкторе с `base_url` и заголовком токена на все запросы) и даёт `close()` — симметрично тому, что CLAUDE.md требует graceful shutdown в `main.py`; composition root закроет клиент при остановке сервиса.
+7. **Таймаут — захардкожен константой модуля**, не новая переменная `Settings`: в таблице Configuration CLAUDE.md таймаута LMS-запроса нет, заводить новую конфигурацию без явного запроса не буду (по аналогии с 64 MiB в `S3Gateway`, тоже константа, не настройка).
+
+### 7.1 `LmsClient` (lms/client.py)
+
+```python
+_TIMEOUT_SECONDS = 30.0
+_ENDPOINT_PATH = "/wp-json/fs-lms/v1/videos"
+
+
+class LmsRegistrationError(Exception):
+    """Базовое исключение при регистрации видео в LMS."""
+
+
+class LmsRetryableError(LmsRegistrationError):
+    """5xx или сетевая ошибка — стоит повторить в следующем цикле сканирования."""
+
+
+class LmsRejectedError(LmsRegistrationError):
+    """Прочие 4xx — LMS отвергла payload содержательно, повторять бессмысленно."""
+
+
+class LmsClient:
+    """REST-клиент fs-lms: POST /wp-json/fs-lms/v1/videos с токеном в заголовке."""
+
+    def __init__(self, base_url: str, token: str) -> None:
+        """Создаёт httpx.Client с base_url и X-FS-Uploader-Token на все запросы."""
+
+    def register(self, payload: dict[str, object]) -> None:
+        """Один POST-запрос; успех — return, иначе — LmsRetryableError/LmsRejectedError."""
+
+    def close(self) -> None:
+        """Закрывает внутренний httpx.Client (graceful shutdown)."""
+```
+
+- [x] Конструктор: `httpx.Client(base_url=..., headers={"X-FS-Uploader-Token": token}, timeout=_TIMEOUT_SECONDS, transport=...)`. Добавлен keyword-only `transport: httpx.BaseTransport | None = None` сверх постановки — штатная точка подмены сети у самого `httpx` (`MockTransport` в тестах), в проде остаётся `None` → используется стандартный транспорт.
+- [x] `register`: `try/except httpx.HTTPError` → `LmsRetryableError`.
+- [x] Классификация: `{200, 201}` → `return`; `>= 500` → `LmsRetryableError`; иначе → `LmsRejectedError`. Сообщение — код + обрезанное тело (`[:500]`).
+- [x] `close()` — `self._client.close()`.
+- [x] Логгер `video_uploader.lms.client` заведён, сами методы не логируют.
+
+### 7.2 Тесты (`tests/lms/test_client.py`, 13 тестов)
+
+- [x] 200/201 → без исключений; тело запроса — валидный JSON = payload, заголовок токена, путь запроса.
+- [x] 500/502/503 → `LmsRetryableError` (код и фрагмент тела — в тексте исключения).
+- [x] 400/404/422 → `LmsRejectedError`; отдельный тест фиксирует, что это **не** `LmsRetryableError` (проверка направления иерархии, не только факта своего типа).
+- [x] Сетевая ошибка (`MockTransport`, хендлер бросает `httpx.ConnectError`) → `LmsRetryableError`.
+- [x] `close()`: последующий `register()` на закрытом клиенте поднимает `RuntimeError` (это `httpx`, не `httpx.HTTPError` — наружу, не оборачивается).
+
+### Definition of Done (этап 7)
+
+- [x] Решение по пункту 3 подтверждено вами — payload-словарь.
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 176/176 тестов.
+- [x] Ревью Claude пройдено (код и тесты написаны Claude по вашей просьбе).
+- [ ] Коммит — на вашей стороне.
