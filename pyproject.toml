@@ -41,6 +41,7 @@ testpaths = ["tests"]
 
 [dependency-groups]
 dev = [
+    "boto3-stubs[s3]>=1.43.49",
     "mypy>=2.3.0",
     "pytest>=9.1.1",
     "ruff>=0.15.21",

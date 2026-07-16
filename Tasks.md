@@ -285,7 +285,7 @@ class StabilityChecker:
 
 ---
 
-## Этап 5 — Метаданные и резолвинг группы ← ТЕКУЩИЙ
+## Этап 5 — Метаданные и резолвинг группы
 
 **Цель:** две реализации `DateExtractor` (Protocol уже есть с этапа 1 — `metadata/base.py`, менять не нужно) и `GroupResolver`, который превращает сырое имя папки в `slug` + блок `lms`. Оба независимы: `metadata/*` ничего не знает про группы, `resolving/resolver.py` ничего не знает про даты. Склейка в цепочку `FilenameDateExtractor → FileStatDateExtractor` с публикацией `DateFallback` и рейт-лимитом `GroupUnmapped` — **не сюда**, это работа оркестратора `pipeline.py` на этапе 8 (у него есть понятие «цикл сканирования» и доступ к `EventBus`, а у стратегий и резолвера — нет).
 
@@ -373,4 +373,99 @@ class GroupResolver:
 
 - [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 146/146 тестов.
 - [x] Ревью Claude пройдено (код и тесты написаны Claude по вашей просьбе; отклонений от постановки нет).
+- [ ] Коммит — на вашей стороне.
+
+---
+
+## Этап 6 — Хранилище S3 (KeyBuilder + S3Gateway) ← ТЕКУЩИЙ
+
+**Цель:** `KeyBuilder` — чистые функции построения ключей (видео + манифест) без единого обращения к сети; `S3Gateway` — тонкий adapter над boto3 (upload видео, put манифеста, verify по `head_object`). Хэширование (`sha256`) — **не сюда**: как явно записано в памяти проекта, это работа `pipeline.py` (этап 8), у него есть доступ к `StateRepository`-кэшу по `(path, size, mtime)`. Сборка манифеста и `x-amz-meta-*`-словаря из `LessonMeta`/`UploadResult` (домена) — тоже этап 8: `S3Gateway` не должен знать про группы/`lms` (CLAUDE.md, SOLID-S), он принимает уже готовые примитивы (ключ-строку, plain-словарь метаданных, JSON-сериализуемый словарь манифеста).
+
+**Затрагиваемые файлы:** `video_uploader/storage/key_builder.py`, `video_uploader/storage/s3_gateway.py`, `pyproject.toml` (mypy override, см. решение 1), `tests/storage/test_key_builder.py`, `tests/storage/test_s3_gateway.py`.
+
+### Решения, принятые в постановке (обсуждаем, если не согласны)
+
+1. ~~boto3 без типов: mypy-override~~ — **решено: вариант (а), `boto3-stubs[s3]`**. Установлено (`uv add --dev "boto3-stubs[s3]"`): `boto3-stubs==1.43.49`, `botocore-stubs==1.43.14`, `mypy-boto3-s3==1.43.31`, `types-s3transfer==0.16.0`, `types-awscrt==0.34.1`. Пункт 6.3 (mypy override) больше не нужен — `boto3.client("s3", ...)` теперь типизируется настоящим `S3Client` через overload по строковому литералу `"s3"`; для этого важно **не терять литерал** — писать `boto3.client("s3", ...)` напрямую (не через промежуточную переменную `service_name: str = "s3"`), иначе overload не сработает и тип снова расплывётся до `Any`.
+2. **`KeyBuilder` принимает примитивы, не `LessonMeta`**: `build_video_key(group_slug, recorded_at, sha256, ext)` — так же, как `VideoScanner`/`StabilityChecker` на этапе 4 брали примитивы через конструктор, а не целиком `Settings`. `storage/` не обязан импортировать `domain/` ради четырёх значений.
+3. **`KeyBuilder` сам проверяет charset ключа** (`[a-z0-9./_-]`) после сборки и падает `ValueError`, если что-то не так — это прямое требование Strict Rules CLAUDE.md («кириллица и пробелы в ключах S3 запрещены»), а не просто доверие тому, что `group_slug` уже провалидирован на входе в `groups.yaml` (защита от будущих ошибок, а не дублирование чужой валидации).
+4. **Дата в ключе — `recorded_at.strftime(...)` без конвертации таймзоны**: `LessonMeta.recorded_at` уже tz-aware в `TZ_NAME`, ключ должен содержать те же «настенные» цифры, что и в примере CLAUDE.md (`16-04` совпадает с `16:04:45` в манифесте) — никакого приведения к UTC для этой части.
+5. **`S3Gateway` не ловит исключения boto3** — методы просто вызывают `self._client.upload_file(...)`/`put_object(...)`/`head_object(...)` и дают ошибке всплыть. Изоляция ошибок по файлу — обязанность `pipeline.py` (Processing Rules: «обработка каждого файла в try/except»); дублировать `try/except` внутри тонкого adapter'а незачем.
+6. **`S3Gateway` валидирует ASCII в `metadata`-словаре перед вызовом boto3** — это тоже прямой Strict Rule («кириллица и пробелы... в `x-amz-meta-*` запрещены»), а не только про ключи. Без этой проверки ошибка всплыла бы поздно и невнятно — где-то в недрах `botocore`/`urllib3` при кодировании HTTP-заголовка.
+7. **Ключи `Metadata=` без префикса `x-amz-meta-`** — это нюанс самого boto3: параметр `ExtraArgs={"Metadata": {...}}` в `upload_file` автоматически добавляет префикс `x-amz-meta-` к каждому ключу словаря. То есть вызывающий код (этап 8) должен передавать `{"group-slug": "kege-1", "lms-group-id": "3"}`, **без** ручного `"x-amz-meta-"` — если приписать вручную, получится задвоение.
+8. **Неизвестное расширение → `Content-Type: application/octet-stream`**, не исключение: `ALLOWED_EXTENSIONS` конфигурируем и по умолчанию шире таблицы `ContentType` из CLAUDE.md (`.webm/.mp4/.mkv`) — если админ расширит список в `.env` каким-то ещё форматом, загрузка не должна падать, только тип станет обобщённым.
+9. **Тесты — без реальной сети и без новых зависимостей (`moto` не добавляем)**: `boto3.client` подменяется через `monkeypatch` на самодельный фейковый клиент, который просто запоминает аргументы вызовов. `scripts/smoke_s3.py` (ручная проверка против реального Beget) — это этап 11, не сюда.
+
+### 6.1 `KeyBuilder` (storage/key_builder.py)
+
+```python
+_ALLOWED_KEY_CHARS = re.compile(r"[a-z0-9./_-]+")
+
+
+class KeyBuilder:
+    """Сборка ключей видео и манифеста по соглашению — единственный источник."""
+
+    def __init__(self, prefix: str) -> None:
+        self._prefix = prefix
+
+    def build_video_key(
+        self, group_slug: str, recorded_at: datetime, sha256: str, ext: str
+    ) -> str:
+        """{prefix}/{group_slug}/{yyyy}/{mm}/{yyyy-mm-dd}_{hh-mm}_{sha8}{ext}"""
+
+    def build_manifest_key(self, video_key: str) -> str:
+        """{video_key}.json"""
+```
+
+- [x] `build_video_key`: строка по формату из CLAUDE.md, `ext.lower()`, `sha256[:8]`, `_validate` перед возвратом.
+- [x] `build_manifest_key`: `f"{video_key}.json"`, без повторной валидации.
+- [x] `_validate(key)` — `@staticmethod`, `_ALLOWED_KEY_CHARS.fullmatch(key)` → `ValueError` с ключом в сообщении.
+- [x] `prefix` — параметр конструктора.
+
+### 6.2 `S3Gateway` (storage/s3_gateway.py)
+
+```python
+_MULTIPART_THRESHOLD_BYTES = 64 * 1024 * 1024
+_CONTENT_TYPES = {".webm": "video/webm", ".mp4": "video/mp4", ".mkv": "video/x-matroska"}
+
+
+class S3Gateway:
+    """Шлюз S3 Beget: path-style addressing, multipart upload, put манифеста, verify."""
+
+    def __init__(
+        self, *, endpoint_url: str, region: str, bucket: str, access_key: str, secret_key: str
+    ) -> None:
+        """Собирает boto3-клиент с addressing_style="path" и TransferConfig на 64 MiB."""
+
+    def upload_video(self, path: Path, key: str, metadata: Mapping[str, str]) -> None:
+        """Multipart upload; ContentType по расширению key; ASCII-валидация metadata."""
+
+    def put_manifest(self, key: str, manifest: dict[str, object]) -> None:
+        """put_object с JSON-телом (UTF-8, кириллица в значениях — ОК) и своим ContentType."""
+
+    def verify(self, key: str, expected_size: int) -> bool:
+        """head_object -> ContentLength == expected_size (ETag не используется)."""
+```
+
+- [x] Конструктор: `boto3.client("s3", ...)` с литералом `"s3"` (важно для overload boto3-stubs), `Config(s3={"addressing_style": "path"})`, `TransferConfig` на 64 MiB.
+- [x] `access_key`/`secret_key` — обычные `str`, gateway про `SecretStr`/pydantic не знает.
+- [x] `upload_video`: `_validate_ascii_metadata` → `content_type` по расширению **ключа** (не исходного пути) → `upload_file(..., ExtraArgs={"ContentType": ..., "Metadata": dict(metadata)})`.
+- [x] `put_manifest`: `json.dumps(..., ensure_ascii=False, indent=2)` → `put_object(...)`.
+- [x] `verify`: `head_object` → `int(response["ContentLength"]) == expected_size`.
+- [x] `_validate_ascii_metadata` — модульная функция, не метод.
+- [x] Логгер `video_uploader.storage.s3_gateway` заведён; по решению 5 сами методы ничего не логируют — исключения boto3 не перехватываются.
+
+### 6.3 pyproject.toml
+
+- [x] `boto3-stubs[s3]` добавлен через `uv add --dev` (решение 1) — `boto3-stubs==1.43.49`, `botocore-stubs==1.43.14`, `mypy-boto3-s3==1.43.31`.
+
+### 6.4 Тесты
+
+- [x] `tests/storage/test_key_builder.py` (7 тестов): точное совпадение с примером CLAUDE.md, регистр расширения, кастомный prefix, защитный барьер на кириллице в `group_slug`, `build_manifest_key`.
+- [x] `tests/storage/test_s3_gateway.py` (11 тестов, фейковый boto3-клиент через `monkeypatch.setattr(boto3, "client", ...)` — патчим сам модуль `boto3`, не атрибут `s3_gateway`-модуля, иначе mypy strict ругается на implicit reexport): `upload_file` с правильными `Bucket`/`Key`/`Filename`, `ContentType` по всем 3 известным расширениям + fallback на неизвестном, `Metadata` без ручного префикса `x-amz-meta-`, не-ASCII metadata → `ValueError` до вызова boto3, `put_manifest` — валидный JSON + кириллица без экранирования, `verify` — совпадение/несовпадение размера, конструктор — `path`-style addressing действительно передан.
+
+### Definition of Done (этап 6)
+
+- [x] Решение по пункту 1 подтверждено вами — `boto3-stubs[s3]`.
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 163/163 тестов.
+- [x] Ревью Claude пройдено (код и тесты написаны Claude по вашей просьбе).
 - [ ] Коммит — на вашей стороне.
