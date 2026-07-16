@@ -163,7 +163,7 @@ Header: X-FS-Uploader-Token: {LMS_UPLOADER_TOKEN}
 
 - Идемпотентность — на стороне плагина, upsert по `s3_key`; повторная отправка безопасна.
 - 200/201 → `registered`; 5xx и сетевые ошибки → ретраи с экспоненциальным backoff в следующих циклах; прочие 4xx → `failed` + ERROR, без ретраев.
-- Эндпоинта в fs-lms пока нет — он реализуется отдельно в репозитории плагина. До его появления используется `LMS_DRY_RUN=true`: шаг register логируется и считается успешным.
+- Эндпоинта в fs-lms пока нет — он реализуется отдельно в репозитории плагина. До его появления используется `DRY_RUN=true`: шаги с побочными эффектами (в т.ч. register) логируются и считаются успешными.
 
 ### config/groups.yaml
 
@@ -222,20 +222,20 @@ groups:
 | `GROUPS_FILE`                                 | `/app/config/groups.yaml` | Маппинг групп |
 | `SCAN_INTERVAL_SECONDS`                       | `300` | Период опроса |
 | `STABILITY_MINUTES`                           | `5` | Порог «файл дописан» |
-| `ALLOWED_EXTENSIONS`                          | `.webm` | Кандидаты (при необходимости расширить) |
+| `ALLOWED_EXTENSIONS`                          | `.webm,.mp4,.mkv` | Кандидаты (через запятую) |
 | `DATE_REGEX`                                  | под Телемост | Именованные группы `day/month/year/hour/minute/second` (см. Processing Rules) |
 | `SKIP_OLDER_THAN_DAYS`                        | — | Пропуск залежей (пусто = выкл) |
 | `ARCHIVE_AFTER_REGISTER`                      | `true` | Перемещать исходник в архив после регистрации |
 | `ARCHIVE_SUBDIR`                              | `_uploaded` | Имя архивной подпапки внутри папки группы |
 | `MAX_ATTEMPTS`                                | `5` | Ретраи на файл |
-| `TZ_NAME`                                     | `Europe/Moscow` | TZ для `recorded_at` |
+| `TZ_NAME`                                     | `Europe/Kaliningrad` | TZ для `recorded_at` |
 | `S3_ENDPOINT_URL`                             | `https://s3.ru1.storage.beget.cloud` | Beget S3 |
 | `S3_REGION`                                   | `ru-1` | Для SigV4 |
 | `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` | — | Реквизиты Beget |
 | `S3_KEY_PREFIX`                               | `videos` | Префикс ключей |
 | `LMS_BASE_URL`                                | — | Напр. `http://11.11.11.20:8080` |
 | `LMS_UPLOADER_TOKEN`                          | — | Shared secret |
-| `LMS_DRY_RUN`                                 | `false` | Регистрация «вхолостую» до готовности эндпоинта |
+| `DRY_RUN`                                     | `false` | Сухой прогон: S3/LMS/архивация подменяются заглушками (composition root) |
 | `LOKI_URL`                                    | — | Опция |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`      | — | Опция |
 | `API_PORT`                                    | `8090` | FastAPI |
