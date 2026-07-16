@@ -43,7 +43,12 @@ _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "archived": frozenset(),
     "failed": frozenset({"uploading", "failed"}),
     "skipped_old": frozenset(),
-    "skipped_unmapped": frozenset(),
+    # В отличие от skipped_old (старение необратимо), дыра в groups.yaml может
+    # быть закрыта админом между циклами — файл должен получить шанс на обработку.
+    # "failed" тоже разрешён: если что-то упадёт при повторной попытке resolve
+    # ДО mark_uploading (например, ошибка извлечения даты), pipeline должен
+    # суметь записать mark_failed, а не наткнуться на InvalidTransitionError.
+    "skipped_unmapped": frozenset({"uploading", "failed"}),
 }
 
 
