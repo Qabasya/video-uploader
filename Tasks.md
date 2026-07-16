@@ -282,3 +282,95 @@ class StabilityChecker:
 - [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 131/131 тестов.
 - [x] Ревью Claude пройдено (код и тесты написаны Claude по вашей просьбе, разошедшихся с постановкой мест нет).
 - [ ] Коммит — на вашей стороне.
+
+---
+
+## Этап 5 — Метаданные и резолвинг группы ← ТЕКУЩИЙ
+
+**Цель:** две реализации `DateExtractor` (Protocol уже есть с этапа 1 — `metadata/base.py`, менять не нужно) и `GroupResolver`, который превращает сырое имя папки в `slug` + блок `lms`. Оба независимы: `metadata/*` ничего не знает про группы, `resolving/resolver.py` ничего не знает про даты. Склейка в цепочку `FilenameDateExtractor → FileStatDateExtractor` с публикацией `DateFallback` и рейт-лимитом `GroupUnmapped` — **не сюда**, это работа оркестратора `pipeline.py` на этапе 8 (у него есть понятие «цикл сканирования» и доступ к `EventBus`, а у стратегий и резолвера — нет).
+
+**Затрагиваемые файлы:** `video_uploader/metadata/filename.py`, `video_uploader/metadata/filestat.py`, `video_uploader/resolving/resolver.py`, `tests/metadata/test_filename.py`, `tests/metadata/test_filestat.py`, `tests/resolving/test_resolver.py`.
+
+### Решения, принятые в постановке (если не согласны — обсуждаем до кода)
+
+1. **`tz_name` — параметр конструктора у обеих стратегий**, не аргумент `extract()`: сигнатура `DateExtractor.extract(path) -> datetime | None` уже зафиксирована Protocol'ом с этапа 1 и содержит только `path`. Часовой пояс не меняется между вызовами в рамках одного запуска сервиса — конструктор самое место.
+2. **Default-паттерн живёт в `metadata/filename.py`**, не в `Settings`: `Settings.date_regex` как было `str | None = None` — «не задано» просто означает «использовать встроенный default». Дублировать регэксп-строку в двух местах незачем.
+3. **`FilenameDateExtractor.extract` возвращает `None` на любую невозможность** — нет совпадения по regex, `ValueError` при сборке `datetime` (месяц > 12 и т.п.). Это философия Protocol: «стратегия неприменима» = `None`, решение «что дальше» — у вызывающего (цепочка в pipeline).
+4. **Двузначный год → `20ГГ`, но не только двузначный**: беру длину захваченной строки года — если ровно 2 символа, прибавляю 2000; если больше (кастомный `DATE_REGEX` с `\d{4}`), использую как есть. Дефолтный паттерн Телемоста всегда двузначный, но `DATE_REGEX` можно переопределить в `.env`, и жёстко хардкодить «всегда +2000» было бы неверно для 4-значного варианта.
+5. **`GroupResolver` работает с уже загруженным `GroupsConfig`** (результат `config.load_groups()` из этапа 2.2, передаётся в конструктор) — сам файл не читает, повторной валидации не делает: это забота composition root на этапе 10.
+6. **`GroupResolver.resolve()` возвращает `GroupEntry | None`**, не новый локальный тип: `GroupEntry` (из `config.py`, этап 2.2) уже ровно то, что нужно — `slug` + `lms`, frozen, провалидирован при загрузке. Заводить ещё один датакласс с теми же двумя полями — лишняя абстракция без пользы (CLAUDE.md прямо просит не плодить слои без запроса). Если хотите на этом этапе завести отдельный доменный тип вместо переиспользования `GroupEntry` — скажите, поменяю.
+7. **Сопоставление имени папки — точное, регистрозависимое**, без нормализации: CLAUDE.md прямо говорит «ключ — точное имя подпапки». `"кегэ-1" != "КЕГЭ-1"` — это два разных (не)совпадения, не приводим к одному регистру.
+8. **`GroupResolver` не публикует события и не знает про `EventBus`**: «не чаще раза за цикл на папку» для `GroupUnmapped` — это состояние на уровне цикла сканирования, которого у резолвера нет и не должно быть (SOLID-I: узкий интерфейс). Резолвер просто отвечает `None`; троттлинг и публикация события — pipeline, этап 8.
+
+### 5.1 `FilenameDateExtractor` (metadata/filename.py)
+
+```python
+_DEFAULT_PATTERN = (
+    r"(?P<day>\d{2})_(?P<month>\d{2})_(?P<year>\d{2})"
+    r"_(?P<hour>\d{2})_(?P<minute>\d{2})_(?P<second>\d{2})"
+)
+
+
+class FilenameDateExtractor:
+    """Дата из блока ДД_ММ_ГГ_ЧЧ_ММ_СС (или кастомного DATE_REGEX) в имени файла."""
+
+    def __init__(self, tz_name: str, pattern: str | None = None) -> None:
+        self._tz = ZoneInfo(tz_name)
+        self._pattern = re.compile(pattern or _DEFAULT_PATTERN)
+
+    def extract(self, path: Path) -> datetime | None:
+        """Ищет блок даты в имени файла (не привязан к началу строки)."""
+```
+
+- [x] `pattern` компилируется один раз в конструкторе.
+- [x] `extract`: `self._pattern.search(path.name)`.
+- [x] Нет совпадения → `None`.
+- [x] `match.groupdict()` → `int`-поля; год — `_normalize_year` (решение 4, вынесено отдельным `@staticmethod` для явности).
+- [x] Сборка `datetime(...)` в `try/except ValueError` → `None`.
+- [x] Результат — tz-aware `datetime` в `tz_name`.
+
+### 5.2 `FileStatDateExtractor` (metadata/filestat.py)
+
+```python
+class FileStatDateExtractor:
+    """Fallback: дата из mtime файла, локализованная в tz_name."""
+
+    def __init__(self, tz_name: str) -> None:
+        self._tz = ZoneInfo(tz_name)
+
+    def extract(self, path: Path) -> datetime | None:
+        """mtime — абсолютный момент; локализация в tz_name не меняет сам момент."""
+```
+
+- [x] `path.stat().st_mtime` в `try/except OSError` → `None`.
+- [x] `datetime.fromtimestamp(mtime, tz=self._tz)` — конвертация момента, не наивная дата с приклеенным tzinfo.
+- [x] Практически не возвращает `None` в норме — только гонка с исчезновением файла.
+
+### 5.3 `GroupResolver` (resolving/resolver.py)
+
+```python
+class GroupResolver:
+    """group_folder → GroupEntry (slug + lms) по уже загруженному groups.yaml."""
+
+    def __init__(self, groups_config: GroupsConfig) -> None:
+        self._groups = groups_config.groups
+
+    def resolve(self, group_folder: str) -> GroupEntry | None:
+        """Точное совпадение по имени папки; None — группа не описана в groups.yaml."""
+        return self._groups.get(group_folder)
+```
+
+- [x] Импорт `GroupEntry`, `GroupsConfig` из `video_uploader.config`.
+- [x] Ровно один метод, без побочных эффектов, без `EventBus`.
+
+### 5.4 Тесты
+
+- [x] `tests/metadata/test_filename.py` (11 тестов): реальное имя из CLAUDE.md, двузначный год, «префикс не важен» (`.search`), невалидный месяц → `None`, имя без блока даты → `None`, tz-aware результат + конкретный offset для Калининграда, кастомный паттерн с 4-значным годом (без `+2000`) + проверка, что default-паттерн больше не матчит.
+- [x] `tests/metadata/test_filestat.py` (4 теста): дата соответствует `mtime`, несуществующий путь → `None`, один и тот же момент в двух разных `tz_name` — разный `.hour`, но одинаковый `.timestamp()`.
+- [x] `tests/resolving/test_resolver.py` (3 теста): известная папка резолвится, неизвестная → `None`, разный регистр кириллицы → `None` (решение 7).
+
+### Definition of Done (этап 5)
+
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 146/146 тестов.
+- [x] Ревью Claude пройдено (код и тесты написаны Claude по вашей просьбе; отклонений от постановки нет).
+- [ ] Коммит — на вашей стороне.
