@@ -138,4 +138,71 @@
 
 - [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 97/97 тестов.
 - [x] Ревью Claude пройдено по ходу (2.1–2.4), один найденный баг (`bool`→`int` в `lms`) закрыт.
-- [ ] Коммит в ветку `stage-2` (от `main` после мерджа этапа 1), PR — после подтверждения. **Блокер:** `main` пока не содержит этап 1 (см. DoD этапа 1) — сначала нужно смержить `stage-1`.
+- [x] Закоммичено в ветку `stage-2` (коммит 245ad38). Ветка ответвлена от `stage-1` (не от `main` — `main` пока не содержит этап 1, PR туда ещё не открыт). Осознанное отступление от исходного git-протокола: продолжаем последовательно на `stage-2`, мердж `stage-1`/`stage-2` в `main` — отдельным шагом позже.
+
+---
+
+## Этап 3 — Реестр SQLite (StateRepository) ← ТЕКУЩИЙ
+
+**Цель:** `StateRepository` — единственная точка доступа к `state.db`: заводит запись при обнаружении файла, проводит её через все статусы пайплайна, отдаёт кэшированный `sha256` по `(path, size, mtime)`, не даёт пайплайну коснуться SQLAlchemy напрямую. Пайплайна и самих S3/LMS-вызовов на этом этапе ещё нет — только репозиторий и его тесты.
+
+**Затрагиваемые файлы:** `video_uploader/state/repository.py` (+ модели таблицы в этом же модуле — Repository-пакет маленький, отдельный `models.py` избыточен), `tests/state/test_repository.py`.
+
+### Решения, принятые в постановке (если не согласны — обсуждаем до кода)
+
+1. **SQLAlchemy 2.0 Core+ORM, `Mapped`/`mapped_column` (2.0-style), не legacy `declarative_base()`.** Движок — `create_engine(f"sqlite:///{data_dir}/state.db")`; `PRAGMA journal_mode=WAL` выставляется через `event.listens_for(engine, "connect")` сразу после коннекта (CLAUDE.md требует WAL).
+2. **Одна таблица `files`**, поля — ровно по списку из CLAUDE.md (раздел State): `id, path, group_name, size_bytes, mtime, sha256, status, s3_key, archived_path, attempts, last_error, created_at, updated_at`. Новых полей не добавляем без вашего запроса.
+3. **`status` — `str` с проверкой допустимых значений на уровне репозитория**, не SQLAlchemy `Enum` — проще мигрировать список статусов в будущем, а переходы и так идут только через явные методы репозитория (CLAUDE.md: «никаких сырых UPDATE из пайплайна»).
+4. **Время — `created_at`/`updated_at` в UTC ISO 8601, `str`**, не `DateTime`-колонка с tzinfo-плясками SQLite (SQLite не хранит tz нативно). Присваивается в Python (`datetime.now(UTC).isoformat()`), не `server_default`.
+5. **Сессии — короткоживущие, по одной на вызов метода** (`with Session(self._engine) as session:` внутри каждого публичного метода), не одна долгоживущая сессия на весь репозиторий — так проще про потокобезопасность между циклами сканирования.
+6. **Ключ кэша sha256 — составной `(path, size_bytes, mtime)`**, не просто `path`: ровно так описано в CLAUDE.md («кешируется в реестре по `(path, size, mtime)`») — если файл на шаре подменили (тот же путь, другой размер/mtime), старый хэш не переиспользуется.
+
+### 3.1 Таблица и модель
+
+- [x] `class Base(DeclarativeBase)` и `class FileRecord(Base)` с `__tablename__ = "files"`, все поля из CLAUDE.md через `Mapped[...] = mapped_column(...)`.
+- [x] `id` — `Mapped[int] = mapped_column(primary_key=True)` (autoincrement).
+- [x] `path` — `Mapped[str] = mapped_column(unique=True)`.
+- [x] `sha256`, `s3_key`, `archived_path`, `last_error` — `Mapped[str | None]`, default `None`.
+- [x] `attempts` — `Mapped[int] = mapped_column(default=0)`.
+- [x] `Index("ix_files_path_size_mtime", "path", "size_bytes", "mtime")` в `__table_args__` — под `get_cached_sha256`.
+
+### 3.2 `StateRepository` — создание и инициализация
+
+- [x] Конструктор принимает `Path` к файлу БД, `create_engine`, `event.listen(engine, "connect", _enable_wal)` (не `listens_for` — функциональная форма читается прямее без декоратора), `Base.metadata.create_all(engine)`.
+- [x] Логгер `video_uploader.state.repository` (через `__name__`) — пока не используется внутри методов (нечего логировать сверх того, что делает сам код), объявлен для будущих этапов.
+
+### 3.3 Методы репозитория — переходы статусов
+
+- [x] `discover(path, group_name, size_bytes, mtime) -> int`.
+- [x] `get_cached_sha256(path, size_bytes, mtime) -> str | None`.
+- [x] `set_sha256(file_id, sha256) -> None`.
+- [x] `mark_uploading` / `mark_uploaded(s3_key)` / `mark_registered` / `mark_archived(archived_path)`.
+- [x] `mark_failed(file_id, error) -> None` — инкремент `attempts`, запись `last_error`; повторный вызов из `failed` разрешён явным правилом `"failed": {"uploading", "failed"}` (ретрай пишет `last_error` дальше).
+- [x] `mark_skipped(file_id, status: Literal["skipped_old", "skipped_unmapped"]) -> None`.
+- [x] Недопустимый переход → `InvalidTransitionError` (свой класс исключения); таблица переходов — `_ALLOWED_TRANSITIONS: dict[str, frozenset[str]]`, единая точка правды, без разбросанных `if`.
+- [x] `get_by_id` / `get_by_sha256` — возвращают `FileState | None` (см. 3.4), не `FileRecord`.
+- [x] `count_by_status() -> dict[str, int]`, `get_recent(limit: int) -> list[FileState]`.
+
+### 3.4 Возврат данных наружу
+
+- [x] Выбран вариант «явный маппинг в свой frozen dataclass»: `FileState` (frozen, slots) в `state/repository.py` — копия полей `FileRecord`, но detached от сессии по построению. `_to_state()` — единственная точка конвертации, используется во всех геттерах (`get_by_id`, `get_by_sha256`, `get_recent`) одинаково.
+
+### 3.5 Тесты (`tests/state/test_repository.py`, 18 тестов)
+
+- [x] `discover`: статус `discovered`, идемпотентность повторного вызова того же пути (`get_recent` не плодит вторую запись).
+- [x] `get_cached_sha256`: `None` до `set_sha256`, значение после, промах при изменившемся `size` или `mtime`.
+- [x] Полная happy-path цепочка `discovered → uploading → uploaded → registered → archived` с проверкой `s3_key`/`archived_path`/`updated_at`.
+- [x] `mark_failed`: инкремент `attempts`, `last_error`, повторный вызов копит `attempts` дальше.
+- [x] `mark_skipped` для обоих значений.
+- [x] Недопустимые переходы: `discovered → registered` (минуя upload) и переход из терминального `archived` — оба поднимают `InvalidTransitionError`.
+- [x] `get_by_sha256`: находит `registered`-запись, `None` для незнакомого хэша.
+- [x] WAL: отдельный тест открывает файл БД напрямую через `sqlite3.connect` и проверяет `PRAGMA journal_mode == "wal"`.
+- [x] Персистентность: два экземпляра `StateRepository` на одном файле — второй видит данные первого.
+- [x] Заодно — `count_by_status` и `get_recent(limit=...)` (не входили в исходный список, добавлены как публичные методы 3.3).
+
+### Definition of Done (этап 3)
+
+- [x] `uv add sqlalchemy` выполнен — `sqlalchemy==2.0.51`.
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 115/115 тестов.
+- [x] Ревью Claude пройдено по ходу реализации (само+тесты писал Claude по вашей просьбе, без отдельного цикла правок).
+- [ ] Коммит в `stage-3`, PR — после вашего подтверждения (пока не закоммичено).
