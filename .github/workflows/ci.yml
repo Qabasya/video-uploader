@@ -18,5 +18,5 @@ jobs:
       - run: uv sync --frozen
       - run: uv run ruff format --check .
       - run: uv run ruff check .
-      - run: uv run mypy src
+      - run: uv run mypy video_uploader
       - run: uv run pytest

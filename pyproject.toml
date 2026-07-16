@@ -22,10 +22,11 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-name = "video_uploader"
+module-root = ""
 
 [tool.ruff]
 line-length = 100
-src = ["src", "tests"]
+src = ["."]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "UP", "B"]
