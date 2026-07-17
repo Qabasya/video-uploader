@@ -72,6 +72,10 @@ class S3Gateway:
         response = self._client.head_object(Bucket=self._bucket, Key=key)
         return int(response["ContentLength"]) == expected_size
 
+    def close(self) -> None:
+        """Закрывает пул соединений внутреннего boto3-клиента (graceful shutdown)."""
+        self._client.close()
+
 
 def _validate_ascii_metadata(metadata: Mapping[str, str]) -> None:
     for key, value in metadata.items():

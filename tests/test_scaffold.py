@@ -1,8 +1,10 @@
 """Дымовые тесты каркаса: модули импортируются, версия и точка входа на месте."""
 
 import importlib
+from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 import video_uploader
 from video_uploader.main import main
@@ -53,7 +55,14 @@ def test_version() -> None:
     assert video_uploader.__version__ == "0.1.0"
 
 
-def test_entry_point_stub() -> None:
-    """Точка входа существует и честно сообщает, что сервис ещё не реализован."""
-    with pytest.raises(NotImplementedError):
+def test_main_fails_fast_without_required_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``Settings()`` — первая строка ``main()``: без обязательных переменных падает сразу,
+    не успевая тронуть сеть/потоки/uvicorn."""
+    monkeypatch.chdir(tmp_path)  # не подхватить случайный .env из рабочей директории
+    for name in ("S3_BUCKET", "S3_ACCESS_KEY", "S3_SECRET_KEY", "LMS_BASE_URL", "LMS_HMAC_SECRET"):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(ValidationError):
         main()
