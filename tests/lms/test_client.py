@@ -1,6 +1,10 @@
-"""Тесты LmsClient: классификация ответа, заголовок токена, сетевые ошибки."""
+"""Тесты LmsClient: HMAC-подпись, классификация ответа, поле matched, сетевые ошибки."""
 
+import hashlib
+import hmac
 import json
+import logging
+import time
 
 import httpx
 import pytest
@@ -8,10 +12,63 @@ import pytest
 from video_uploader.lms.client import LmsClient, LmsRejectedError, LmsRetryableError
 
 PAYLOAD = {"s3_key": "videos/kege-1/rec.webm", "group_slug": "kege-1"}
+SECRET = "test-hmac-secret"
 
 
 def make_client(handler: httpx.MockTransport) -> LmsClient:
-    return LmsClient(base_url="http://lms.local", token="secret-token", transport=handler)
+    return LmsClient(base_url="http://lms.local", hmac_secret=SECRET, transport=handler)
+
+
+def make_capturing_client() -> tuple[LmsClient, list[httpx.Request]]:
+    """Клиент с транспортом, который отвечает 200 и запоминает каждый запрос."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200)
+
+    return make_client(httpx.MockTransport(handler)), captured
+
+
+def expected_signature(timestamp: str, raw_body: bytes) -> str:
+    """Независимый (от кода LmsClient) пересчёт подписи — так тест не спишет с реализации."""
+    message = f"{timestamp}.".encode("ascii") + raw_body
+    return hmac.new(SECRET.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+class TestHmacSigning:
+    def test_headers_present_with_fresh_timestamp(self) -> None:
+        client, captured = make_capturing_client()
+
+        client.register(PAYLOAD)
+
+        request = captured[0]
+        assert "X-Fs-Timestamp" in request.headers
+        assert "X-Fs-Signature" in request.headers
+        assert abs(int(request.headers["X-Fs-Timestamp"]) - time.time()) < 5
+
+    def test_signature_matches_independent_computation(self) -> None:
+        client, captured = make_capturing_client()
+
+        client.register(PAYLOAD)
+
+        request = captured[0]
+        expected = expected_signature(request.headers["X-Fs-Timestamp"], request.content)
+        assert request.headers["X-Fs-Signature"] == expected
+
+    def test_content_type_header(self) -> None:
+        client, captured = make_capturing_client()
+
+        client.register(PAYLOAD)
+
+        assert captured[0].headers["Content-Type"] == "application/json"
+
+    def test_body_bytes_match_payload(self) -> None:
+        client, captured = make_capturing_client()
+
+        client.register(PAYLOAD)
+
+        assert json.loads(captured[0].content.decode("utf-8")) == PAYLOAD
 
 
 class TestSuccess:
@@ -22,21 +79,44 @@ class TestSuccess:
 
         client.register(PAYLOAD)  # не должно бросать исключений
 
-    def test_sends_correct_request(self) -> None:
-        captured: list[httpx.Request] = []
+    def test_sends_correct_path(self) -> None:
+        client, captured = make_capturing_client()
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured.append(request)
-            return httpx.Response(200)
-
-        client = make_client(httpx.MockTransport(handler))
         client.register(PAYLOAD)
 
-        assert len(captured) == 1
-        request = captured[0]
-        assert request.url.path == "/wp-json/fs-lms/v1/videos"
-        assert request.headers["X-FS-Uploader-Token"] == "secret-token"
-        assert json.loads(request.content.decode("utf-8")) == PAYLOAD
+        assert captured[0].url.path == "/wp-json/fs-lms/v1/videos"
+
+
+class TestMatchedField:
+    def test_matched_true_no_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"ok": True, "matched": True})
+        )
+        client = make_client(transport)
+
+        with caplog.at_level(logging.WARNING, logger="video_uploader.lms.client"):
+            client.register(PAYLOAD)
+
+        assert caplog.text == ""
+
+    def test_matched_false_logs_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"ok": True, "matched": False})
+        )
+        client = make_client(transport)
+
+        with caplog.at_level(logging.WARNING, logger="video_uploader.lms.client"):
+            client.register(PAYLOAD)  # не должно бросать
+
+        assert "занятие не найдено" in caplog.text
+
+    def test_invalid_json_body_does_not_raise(self) -> None:
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"not json at all")
+        )
+        client = make_client(transport)
+
+        client.register(PAYLOAD)  # успех уже по статусу, парсинг matched — best-effort
 
 
 class TestRetryable:
@@ -68,7 +148,7 @@ class TestRetryable:
 
 
 class TestRejected:
-    @pytest.mark.parametrize("status_code", [400, 404, 422])
+    @pytest.mark.parametrize("status_code", [400, 401, 404, 422])
     def test_other_4xx_raises_rejected(self, status_code: int) -> None:
         transport = httpx.MockTransport(lambda request: httpx.Response(status_code, text="bad"))
         client = make_client(transport)

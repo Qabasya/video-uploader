@@ -85,7 +85,7 @@
 
 ### 2.1 `Settings` (config.py)
 
-- [ ] Все переменные таблицы Configuration CLAUDE.md (+ `DRY_RUN`, − `LMS_DRY_RUN`) как поля `Settings(BaseSettings)`; источник — env и `.env` (`SettingsConfigDict(env_file=".env")`). ⚠️ Осталось: `LMS_UPLOADER_TOKEN` (обязательный `SecretStr`), `TELEGRAM_BOT_TOKEN` (`SecretStr | None`) — отложены Даниилом сознательно; при добавлении дополнить `_empty_str_to_none` (telegram) и тест `test_required_fields_reported`.
+- [ ] Все переменные таблицы Configuration CLAUDE.md (+ `DRY_RUN`, − `LMS_DRY_RUN`) как поля `Settings(BaseSettings)`; источник — env и `.env` (`SettingsConfigDict(env_file=".env")`). ⚠️ Осталось: `TELEGRAM_BOT_TOKEN` (`SecretStr | None`) — отложен Даниилом сознательно, дополнить `_empty_str_to_none` и `test_required_fields_reported` при добавлении. `LMS_UPLOADER_TOKEN` закрыт этапом 8.1 — контракт LMS сменился на HMAC (`LMS_HMAC_SECRET`, `SecretStr`, обязательный), переименовывать в коде было нечего, добавлен сразу под новым именем.
 - [x] Типы: пути — `Path`; числа — `int` с ограничениями; флаги — `bool`; секреты — `SecretStr`.
 - [x] `ALLOWED_EXTENSIONS`: строка «через запятую» → нормализованный кортеж (`NoDecode` + before-валидатор).
 - [x] `TZ_NAME` валидируется через `zoneinfo`; default — `Europe/Kaliningrad` (решение Даниила, CLAUDE.md синхронизирован).
@@ -667,3 +667,169 @@ scan → stability → dedup (реестр) → metadata (дата) → resolve 
   1. **`pipeline.py`** — `mark_registered` мог упасть `InvalidTransitionError` при ретрае после падения именно на шаге `register` (не `upload`): `mark_failed` перезатирал статус `uploaded → failed`, а таблица переходов не пускает `failed → registered` напрямую. Исправлено: если `s3_key` уже есть, а текущий статус `failed` — сначала технически восстанавливаем `uploaded` (`mark_uploading` + `mark_uploaded`, без единого сетевого вызова), только потом `mark_registered`.
   2. **`tests/test_pipeline.py`** — в `FakeS3Gateway.upload_video` вызов записывался в `upload_calls` *после* проверки на ошибку, из-за чего падающие попытки не попадали в счётчик. Поменял порядок: сначала фиксируем вызов, потом решаем, бросать исключение или нет.
 - [ ] Коммит — на вашей стороне.
+
+---
+
+## Этап 8.1 — HMAC-аутентификация LMS (правки по контракту fs-lms) ← ТЕКУЩИЙ
+
+**Контекст:** вы обновили CLAUDE.md (раздел «TODO интеграции с fs-lms», строки 306+) по итогам согласования с плагином (ветка `stage_11`, контракт `FS_LMS_API.md`). Статический токен `X-FS-Uploader-Token` заменён на HMAC-подпись (та же схема, что у модуля AdSync), плюс плагин теперь возвращает поле `matched` в ответе. Это не новый шаг пайплайна — правки точечные, в уже написанном коде этапов 2 и 7. `pipeline.py` не трогаем: REST-payload и Protocol `RegistrationClient` не изменились, меняется только *механика аутентификации* внутри `LmsClient`.
+
+**Затрагиваемые файлы:** `video_uploader/lms/client.py`, `video_uploader/config.py`, `.env.example`, `config/groups.yaml.example`, `tests/lms/test_client.py`, `tests/test_config.py`, `tests/test_groups.py` (один тест на новый реальный кейс).
+
+### Решения
+
+1. **`raw_body` — сериализуем JSON один раз, переиспользуем для подписи и отправки.** Критично: если `httpx` пересериализует payload сам (через `json=`), байты подписи и байты тела могут разойтись (другой порядок ключей/пробелы) — плагин пересчитает HMAC от полученных байт и получит несовпадение → `401`. Поэтому `self._client.post(..., content=raw_body, ...)`, не `json=payload`; `Content-Type: application/json` выставляется вручную в заголовках запроса (при `content=` `httpx` его сам не проставляет, в отличие от `json=`).
+2. **Сообщение для HMAC — конкатенация байтов, не строк**: `f"{timestamp}.".encode("ascii") + raw_body`, эквивалентно `"{timestamp}.{raw_body}"` из контракта, но без риска мисматча кодировки при склейке `str` и `bytes`.
+3. **Таймстамп — `int(time.time())` прямо в `register()`**, без инъекции часов через конструктор: тесты пересчитывают ожидаемую подпись из **фактически отправленного** `X-Fs-Timestamp` (перехваченного через `httpx.MockTransport`), а не мокают время. Проще, чем городить `Clock`-протокол ради одного метода.
+4. **`matched: false` — не исключение**, а `logger.warning(...)` внутри `register()` после успешного статуса; сам факт успеха (`return` без ошибки) не меняется — CLAUDE.md прямо говорит «для сервиса оба случая = registered». Тело ответа парсится в `try/except ValueError` (`response.json()` бросает `json.JSONDecodeError`, это подкласс `ValueError`) — если плагин однажды пришлёт `200` без валидного JSON, не должны с этого падать, раз статус уже говорит об успехе.
+5. **`lms_hmac_secret: SecretStr` — обязательное поле** (без default), тем же паттерном, что `s3_secret_key`: это и был исходный план для LMS-секрета ещё на этапе 2.1, до того как вы сознательно отложили его добавление. Теперь добавляем сразу под правильным именем — переименовывать в коде нечего.
+6. **`GroupResolver`/`GroupEntry`/`GroupsConfig` не переименовываем.** CLAUDE.md прямо говорит: «Сервис папки не различает — семантику задаёт состав `lms`-блока в конфиге», и пункт 5 TODO подтверждает «кода это не требует». Переименование устоявшихся классов ради терминологии («группа» → «папка/сущность») — не запрошено и добавило бы churn без функциональной пользы.
+
+### 8.1.1 `LmsClient` (lms/client.py) — переписать аутентификацию
+
+```python
+def __init__(self, base_url: str, hmac_secret: str, *, transport: httpx.BaseTransport | None = None) -> None:
+    """httpx.Client без постоянных заголовков — HMAC считается заново на каждый запрос."""
+
+def register(self, payload: dict[str, object]) -> None:
+    """Сериализует payload один раз, подписывает те же байты, шлёт их же."""
+
+def _sign(self, timestamp: int, raw_body: bytes) -> str:
+    """hex(hmac_sha256(f"{timestamp}." + raw_body, hmac_secret))."""
+```
+
+- [x] Конструктор: параметр `token: str` → `hmac_secret: str`; `httpx.Client` больше не получает `headers={...}` при создании (HMAC-заголовки — per-request, не постоянные).
+- [x] `register`: `raw_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")`; `timestamp = int(time.time())`; `signature = self._sign(timestamp, raw_body)`; заголовки `{"X-Fs-Timestamp": str(timestamp), "X-Fs-Signature": signature, "Content-Type": "application/json"}`; `self._client.post(_ENDPOINT_PATH, content=raw_body, headers=headers)`.
+- [x] Классификация ответа — **без изменений** (200/201 успех, 5xx retryable, прочие 4xx rejected); на успехе — новый вызов `_log_match_status(response)` перед `return`.
+- [x] `_log_match_status(response)` — `try: data = response.json() except ValueError: return`; если `isinstance(data, dict) and data.get("matched") is False` → `logger.warning(...)`.
+- [x] `close()` — без изменений.
+
+### 8.1.2 `config.py`
+
+- [x] `lms_hmac_secret: SecretStr` — обязательное поле, рядом с `s3_secret_key` в блоке «Секреты».
+- [x] Обновить тест `test_required_fields_reported` в `tests/test_config.py` — теперь 5 обязательных полей, не 4.
+- [x] Добавить `lms_hmac_secret` в хелпер `REQUIRED`/`_make_settings` в `tests/test_config.py`, иначе все существующие тесты `Settings` перестанут собираться.
+
+### 8.1.3 `.env.example`
+
+- [x] `LMS_UPLOADER_TOKEN=` → `LMS_HMAC_SECRET=`, комментарий — «Секрет HMAC-подписи (= `FS_LMS_VIDEO_HMAC_SECRET` в wp-config плагина)».
+
+### 8.1.4 `config/groups.yaml.example`
+
+- [x] Добавить пример персональной папки преподавателя (`"Индивидуальные-Петров"` → `lms: {teacher_username: "i.petrov"}`, без `group_id`), с комментарием про две ветки резолва на стороне плагина (по составу `lms`-блока) — как в примере CLAUDE.md.
+
+### 8.1.5 Тесты
+
+`tests/lms/test_client.py` — переписать под HMAC (статический токен и его заголовок больше не существуют):
+- [x] Заголовки `X-Fs-Timestamp`/`X-Fs-Signature` присутствуют в запросе; `X-Fs-Timestamp` — целое число, близкое к текущему времени (например, `abs(int(request.headers["X-Fs-Timestamp"]) - time.time()) < 5`).
+- [x] Подпись валидна: пересчитать `hmac_sha256(f"{ts}.".encode() + request.content, secret)` из перехваченного запроса и сверить с `X-Fs-Signature`.
+- [x] `Content-Type: application/json` присутствует.
+- [x] Тело запроса, декодированное из `request.content`, равно исходному payload (побайтовое соответствие тому, что ушло на подпись, — не косвенно через `json=`).
+- [x] 200 с `{"ok": true, "matched": true, ...}` → `register()` не бросает, `caplog` **не** содержит WARNING про непривязанное занятие.
+- [x] 200 с `{"matched": false, ...}` → не бросает, но `caplog` содержит WARNING.
+- [x] 200 с невалидным JSON-телом → не бросает (ответ уже успешный по статусу, парсинг `matched` — best-effort).
+- [x] Существующие тесты классификации (500/503 → `LmsRetryableError`, 400/404/422 → `LmsRejectedError`, сетевая ошибка, `close()`) — актуализировать под новую сигнатуру `LmsClient(base_url, hmac_secret, transport=...)`, поведение не меняется.
+
+`tests/test_groups.py`:
+- [x] Один новый тест: `lms: {teacher_username: "i.petrov"}` без `group_id` — валидируется как обычная запись (документирует реальный кейс из обновлённого CLAUDE.md; код уже поддерживает это без изменений — `lms`-блок opaque).
+
+### Definition of Done (этап 8.1)
+
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто.
+- [x] Ревью Claude пройдено, замечания закрыты.
+- [ ] Коммит — на вашей стороне.
+
+### Не код (зафиксировано для памяти, не задача этого репозитория)
+
+- **NTP** (пункт 4 TODO CLAUDE.md): часы LXC должны быть синхронизированы — окно HMAC ±300 c, рассинхрон часов → `401`. Это настройка хоста (`chrony`/`systemd-timesyncd`), проверить при деплое на этапе 11 (поставка), не задача кода.
+- **Процесс** (пункт 7 TODO): завести персональные папки преподавателей на шаре (`Sync-VideoGroups.ps1`/вручную) и согласовать с преподавателями, что индивидуальные записи кладутся в личную папку — организационная договорённость, не код.
+
+---
+
+## Этап 9 — Логи и уведомления
+
+**Цель:** `logging.Handler`-стратегии, фабрика, собирающая их из `Settings`. Ключевое эргономическое требование (по вашей просьбе): после того как фабрика один раз настроит логгер `video_uploader` в `main.py` (этап 10), **любой код в любом модуле** логирует куда угодно просто через `logging.getLogger(__name__)` + `.info()/.warning()/.error()` — без импорта чего-либо из `logging_setup`. Это и есть «удобно и универсально»: не новый API, а корректно настроенная стандартная иерархия логгеров stdlib.
+
+**⚠️ Скоуп изменён по ходу этапа (2026-07-17).** Изначально планировались три хендлера (file/loki/telegram) и `TelegramNotifier`-подписчик `EventBus` для бизнес-уведомлений. **Вы приняли архитектурное решение отказаться от прямой Telegram-интеграции в этом сервисе**: Telegram-бот (и любые другие боты) будете делать отдельным сервисом на `aiogram`, вне этого репозитория. **Loki становится основным каналом** для такого бота — он будет читать события из Loki, а не получать вебхуки/push от `fs-video-uploader` напрямую. Соответственно:
+- `logging_setup/telegram.py` (`TelegramLogHandler`) и `notifications/telegram.py` (`TelegramNotifier`) — **возвращены в состояние заглушки**, реализация отменена. `TELEGRAM_BOT_TOKEN` в `Settings` не добавляется. Обе заглушки помечены докстрингом «отложено 2026-07-17», чтобы будущая сессия понимала, что это осознанный откат, а не недоделанный этап 9.
+- Обсуждали и вариант push-вебхука от `EventBus`-подписчика к боту (симметрично `lms/client.py`) — вы явно предпочли poll/read-из-Loki, вебхук не делаем.
+
+**Найденный по ходу этапа пробел (не связан с решением про Telegram, актуален независимо):** `pipeline.py` публиковал события `GroupUnmapped`/`DateFallback` в `EventBus`, но **не логировал** их через `logging` — а CLAUDE.md прямо требует WARNING-уровень для обоих. Без лога они не долетали ни до файла, ни (что стало важно сегодня) до Loki. Исправлено. Заодно — по вашему решению сделать Loki основным каналом — добавлены INFO-логи на успешные шаги (`VideoUploaded`/`VideoRegistered`/`VideoArchived`), которых раньше не было вовсе (эти события тоже раньше жили только в `EventBus`, без следа в `logging`).
+
+**Затрагиваемые файлы (по факту):** `video_uploader/logging_setup/loki.py`, `video_uploader/logging_setup/factory.py`, `video_uploader/pipeline.py` (точечные логи), `tests/logging_setup/test_loki.py`, `tests/logging_setup/test_factory.py`, правки в `tests/test_pipeline.py`.
+
+### Решения
+
+1. **Loki — основной канал наблюдаемости; Telegram/другие боты — читатели Loki, не получатели push от этого сервиса.** Ваше решение 2026-07-17, отменяет исходные пункты 1–2 постановки (выбор события для бизнес-уведомления, наполнение текста) — они больше не применимы, Telegram-уведомления из этого репозитория не отправляются.
+2. **Один HTTP-запрос на запись, без батчинга** — в `LokiHandler`. Сервис фоновый, малый объём логов — батчинг с таймером флаша добавил бы сложность без реальной пользы на этом масштабе.
+3. **Ошибки внутри `logging.Handler.emit()` — через `self.handleError(record)`**, стандартный механизм stdlib `logging`, а не собственный `try/except` с `logger.exception` (риск зацикливания — хендлер логирования сам логирует свою поломку тем же логированием).
+4. **`configure_logging(settings)` вешает хендлеры на логгер `"video_uploader"`, не на root**, и выставляет `propagate = False`. Так сторонние библиотеки (`boto3`, `httpx`, `sqlalchemy`) не заваливают наши синки своим внутренним логом, и нет риска задвоения, если что-то ещё (например, `uvicorn`) сконфигурирует root-логгер по-своему.
+5. **Уровень логгера `"video_uploader"` — `INFO` захардкожен**, не новая переменная `Settings`: в таблице Configuration `LOG_LEVEL` нет, заводить новую настройку без запроса не буду.
+6. **`LokiHandler` получает `transport: httpx.BaseTransport | None = None`** — та же точка тестовой подмены сети, что уже была у `LmsClient` (этап 7): штатный механизм `httpx`, не monkeypatch.
+7. **INFO-логи успешных шагов и WARNING для `GroupUnmapped`/`DateFallback` — прямо рядом с `events.publish(...)` в `pipeline.py`**, не через отдельного generic-подписчика «событие → лог». `EventBus` и `logging` — параллельные, независимые каналы с разными потребителями (уведомления vs наблюдаемость); подмешивать один в другой через дополнительную абстракцию не было запрошено, а прямой вызов `logger.info/warning` рядом с местом действия — ровно то же самое, что уже сделано для `logger.exception` в `_fail`.
+
+### 9.1 `LokiHandler` (logging_setup/loki.py)
+
+- [x] `__init__(self, url: str, *, transport: httpx.BaseTransport | None = None)`.
+- [x] `emit`: `{"streams": [{"stream": {"service": "fs-video-uploader", "level": record.levelname, "logger": record.name}, "values": [[str(int(record.created * 1e9)), self.format(record)]]}]}` → `POST /loki/api/v1/push`; `try/except httpx.HTTPError: self.handleError(record)`.
+- [x] Таймаут запроса — 5 с, константа модуля.
+- [x] `close()` — закрывает `httpx.Client`, затем `super().close()`.
+
+### 9.2 `TelegramLogHandler` (logging_setup/telegram.py) — отменено, см. врезку выше
+
+- [x] Возвращён в состояние заглушки с докстрингом «отложено 2026-07-17».
+
+### 9.3 `logging_setup/factory.py`
+
+- [x] `logger = logging.getLogger("video_uploader")`; `setLevel(logging.INFO)`; `propagate = False`; `handlers.clear()` (идемпотентность).
+- [x] file: `(settings.data_dir / "logs").mkdir(parents=True, exist_ok=True)`; `RotatingFileHandler(..., maxBytes=10*1024*1024, backupCount=5, encoding="utf-8")`; `Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s")`.
+- [x] loki: `if settings.loki_url is not None:` → `LokiHandler(settings.loki_url)` с тем же форматтером.
+- [x] Telegram-ветка удалена (решение 1).
+
+### 9.4 `TelegramNotifier` (notifications/telegram.py) — отменено, см. врезку выше
+
+- [x] Возвращён в состояние заглушки с докстрингом «отложено 2026-07-17».
+
+### 9.5 `config.py` / `.env.example`
+
+- [x] `telegram_bot_token` **не добавлен** — решение 1, больше не нужен этому сервису.
+
+### 9.6 `pipeline.py` — недостающие логи (найдено по ходу этапа)
+
+- [x] `DateFallback`: `logger.warning("дата занятия не найдена в имени файла, взят mtime: %s", video_file.path)` перед `events.publish(...)`.
+- [x] `GroupUnmapped`: `logger.warning("папка отсутствует в groups.yaml: %s", video_file.group_folder)` перед `events.publish(...)` — внутри того же `if ... not in warned_folders`, так что тоже не чаще раза за цикл на папку.
+- [x] `VideoUploaded`: `logger.info("видео загружено: %s -> %s", video_file.path, s3_key)` — и в основном потоке, и в `_replay_duplicate` (с пометкой «дубликат по контенту» в тексте).
+- [x] `VideoRegistered`: `logger.info("видео зарегистрировано в LMS: %s -> %s", ...)` — аналогично, оба места.
+- [x] `VideoArchived`: `logger.info("исходник перемещён в архив: %s -> %s", video_file.path, target)`.
+
+### 9.7 Тесты
+
+`tests/logging_setup/test_loki.py` (7 тестов, `httpx.MockTransport`, тот же подход, что у `LmsClient`):
+- [x] Форма push-запроса (`streams[0].stream` — `service`/`level`/`logger`; `values[0]` — `(timestamp_ns, formatted_line)`).
+- [x] Кастомный `Formatter`, если задан через `setFormatter`, реально используется в `values[0][1]`.
+- [x] Сетевая ошибка не поднимает исключение из `emit()`.
+- [x] Сетевая ошибка вызывает именно `self.handleError(record)` (проверено через `monkeypatch.setattr` на сам метод хендлера).
+- [x] `close()` закрывает внутренний `httpx.Client` (`is_closed`).
+
+`tests/logging_setup/test_factory.py` (5 тестов):
+- [x] Только `DATA_DIR` → ровно один хендлер (file, `RotatingFileHandler`).
+- [x] `LOKI_URL` задан → добавлен `LokiHandler`, хендлеров два.
+- [x] Повторный вызов `configure_logging` не удваивает хендлеры.
+- [x] `propagate is False`.
+- [x] Интеграционный тест на саму суть эргономического требования: `logging.getLogger("video_uploader.some.module").info(...)` после `configure_logging(...)` долетает до `DATA_DIR/logs/uploader.log`.
+
+`tests/test_pipeline.py` — три существующих теста дополнены проверками логов (не новые тесты, усилены существующие):
+- [x] `TestGroupUnmapped.test_rate_limited_once_per_cycle` — WARNING с именем папки встречается в `caplog` ровно один раз за цикл (симметрично проверке на само событие).
+- [x] `TestDateFallback.test_event_published_and_date_used` — WARNING с именем файла присутствует.
+- [x] `TestHappyPath.test_file_reaches_archived` — INFO-сообщения на «загружено»/«зарегистрировано»/«архив» присутствуют.
+
+### Definition of Done (этап 9)
+
+- [x] Решение 1 (Loki — основной канал, Telegram отменён в этом репозитории) подтверждено вами.
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 210/210 тестов.
+- [x] Ревью Claude пройдено (код и тесты написаны Claude по вашей просьбе).
+- [ ] Коммит — на вашей стороне.
+
+### Не код (важно для будущего aiogram-сервиса, не задача этого репозитория)
+
+- Отдельный сервис на `aiogram` будет читать события из Loki (poll/tail через Loki API), а не получать push от `fs-video-uploader`. Раз так, стоит держать в уме на будущих этапах: тексты в `logger.info/warning(...)` в `pipeline.py` — это теперь не просто диагностика для вас, а фактический источник данных для внешнего потребителя. Если формат текста понадобится менять (например, для более простого парсинга ботом), это тронет уже написанный код `pipeline.py`, а не `logging_setup/`.
