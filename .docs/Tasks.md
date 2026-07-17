@@ -833,3 +833,176 @@ def _sign(self, timestamp: int, raw_body: bytes) -> str:
 ### Не код (важно для будущего aiogram-сервиса, не задача этого репозитория)
 
 - Отдельный сервис на `aiogram` будет читать события из Loki (poll/tail через Loki API), а не получать push от `fs-video-uploader`. Раз так, стоит держать в уме на будущих этапах: тексты в `logger.info/warning(...)` в `pipeline.py` — это теперь не просто диагностика для вас, а фактический источник данных для внешнего потребителя. Если формат текста понадобится менять (например, для более простого парсинга ботом), это тронет уже написанный код `pipeline.py`, а не `logging_setup/`.
+
+---
+
+## Этап 10 — Composition root (main.py + api/app.py) ← ТЕКУЩИЙ
+
+**Цель:** `main.py` собирает все зависимости из `Settings` (единственное место, где создаётся `Settings()`), запускает фоновый воркер сканирования и HTTP API, корректно завершается по SIGTERM. `api/app.py` — тонкий FastAPI-слой поверх `StateRepository`/воркера, без бизнес-логики. Это последний этап, где появляется новый код пайплайна — этап 11 (поставка) уже про Docker/README/smoke-скрипт, не про Python-логику.
+
+**Затрагиваемые файлы:** `video_uploader/main.py`, `video_uploader/api/app.py`, `tests/test_main.py`, `tests/api/test_app.py`. Новых зависимостей не требуется — `fastapi`/`uvicorn` уже в `pyproject.toml` с этапа 1.
+
+### Решения
+
+1. **`uvicorn.run(app, host="0.0.0.0", port=settings.api_port)` блокирует главный поток; воркер — отдельный `threading.Thread`, запущенный ДО вызова `uvicorn.run`.** Порядок ровно как в докстринге заглушки CLAUDE.md: «воркер (фоновый поток) + uvicorn». `host="0.0.0.0"` захардкожен (не новая переменная `Settings` — в таблице Configuration только `API_PORT`, хоста нет): внутри контейнера иначе порт не будет достижим снаружи.
+2. **Graceful shutdown по SIGTERM — не через свой `signal.signal(...)`, а через встроенный механизм uvicorn.** `uvicorn.run()`, вызванный в главном потоке, сам ставит обработчики SIGINT/SIGTERM, аккуратно останавливает HTTP-сервер и **возвращает управление** — сигнал не нужно ловить отдельно. После возврата из `uvicorn.run()` (в `finally`) останавливаем воркер: `worker.stop()` + `worker_thread.join()`. Свой обработчик сигнала здесь избыточен и рискует конфликтовать с uvicorn-овским (Python допускает один обработчик на сигнал).
+3. **`/rescan` не запускает скан напрямую и не ждёт его завершения** — он лишь «будит» воркер (`threading.Event.set()`), прерывая текущий `sleep` между циклами. Единственный поток, который когда-либо вызывает `pipeline.run_cycle()`, — воркер; так гарантированно нет двух параллельных прогонов пайплайна по одной и той же SQLite (репозиторий на это не рассчитан — короткоживущие сессии, но не защита от гонки двух полных циклов одновременно). `POST /rescan` возвращает `{"status": "triggered"}` сразу, не дожидаясь результата — это соответствует слову «триггер» в описании эндпоинта CLAUDE.md.
+4. **`ScanWorker` — отдельный класс внутри `main.py`**, не просто функция: инкапсулирует `stop_event`/`wake_event`/`last_scan_at` и не требует нового файла (Architecture-таблица CLAUDE.md называет только `main.py` для composition root). Публичный интерфейс — `run()` (тело потока), `stop()`, `request_rescan()`, атрибут `last_scan_at: datetime | None`.
+5. **Ошибка целого цикла (не отдельного файла) ловится в `ScanWorker.run()`**, вокруг вызова `pipeline.run_cycle()` — дополнительный внешний защитный слой поверх уже существующей поштучной изоляции файлов внутри `_process`. Причина: `VideoScanner.scan()` может упасть на самом верхнем уровне (`video_root.iterdir()` — решение этапа 4: недоступность `VIDEO_ROOT` не перехватывается специально, «должен упасть»), а раз-два в рантайме SMB-шара может быть недоступна временно — сервис не должен падать целиком, только пропустить цикл и попробовать снова через `SCAN_INTERVAL_SECONDS`. `logger.exception(...)` + продолжение цикла.
+6. **`api/app.py` не импортирует `ScanWorker` из `main.py`.** Обратная зависимость (composition root импортируется тем, что он сам собирает) — архитектурный запах и потенциальный циклический импорт (`main.py` импортирует `create_app` из `api/app.py`, а `api/app.py` импортировал бы `ScanWorker` оттуда же обратно). Вместо этого в `api/app.py` — узкий `Protocol` (`ScanWorkerLike`, всего `last_scan_at` + `request_rescan()`), тот же приём, что `UploadGateway`/`RegistrationClient` в `pipeline.py` (этап 8, решение 3). `StateRepository` — без Protocol: он и так единственная реализация, никогда не подменяется (решение подтверждено ещё на этапе 8, пункт 3 — «`StateRepository` за Protocol не прячем»).
+7. **DRY_RUN-заглушки (`DryRunS3Gateway`, `DryRunLmsClient`) — тоже в `main.py`**, реализуют те же Protocol (`UploadGateway`/`RegistrationClient` из `pipeline.py`), структурно, без наследования. Только логируют `INFO` и возвращают успех/`True`. Архивация в dry-run уже устроена иначе (этап 8, решение 12: единственная ветка `if self._dry_run` внутри самого `Pipeline`, не через инъекцию объекта) — для неё отдельная заглушка не нужна.
+8. **Порядок сборки в `main()` важен**: `configure_logging(settings)` вызывается **до** создания `StateRepository`. `configure_logging` создаёт `settings.data_dir / "logs"` через `mkdir(parents=True, exist_ok=True)` — побочным эффектом это создаёт и сам `settings.data_dir`, если его ещё нет. Если поменять порядок, `StateRepository` может упасть на несуществующей директории для `state.db`.
+9. **`Settings()`/`load_groups(...)` не оборачиваются в `try/except` в `main()`.** Обе ошибки — pydantic `ValidationError` — уже сами по себе достаточно информативны («падение на старте с внятным сообщением», CLAUDE.md), самим этим требованием оправдан fail-fast без дополнительной обработки.
+10. **`.close()` для `S3Gateway`/`LmsClient` (или их dry-run заглушек) — в `finally` после остановки воркера.** Оба класса (и заглушки, для единообразия — у них тоже пустой `close()`) владеют `httpx.Client`; закрывать нужно после того, как воркер точно не будет делать новых запросов (иначе теоретическая гонка — воркер начинает новый цикл, а клиент уже закрыт).
+
+### 10.1 `ScanWorker` и DRY_RUN-заглушки (main.py)
+
+```python
+class ScanWorker:
+    """Периодический запуск Pipeline.run_cycle() в фоновом потоке + внеочередной триггер."""
+
+    def __init__(self, pipeline: Pipeline, scan_interval_seconds: int) -> None:
+        self._pipeline = pipeline
+        self._scan_interval_seconds = scan_interval_seconds
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self.last_scan_at: datetime | None = None
+
+    def run(self) -> None:
+        """Тело потока: цикл до stop(), прерываемый заранее через request_rescan()."""
+
+    def request_rescan(self) -> None:
+        """Будит поток немедленно, не дожидаясь SCAN_INTERVAL_SECONDS."""
+
+    def stop(self) -> None:
+        """Просит поток завершиться на следующей проверке; тоже будит его."""
+
+
+class DryRunS3Gateway:
+    """DRY_RUN=true: не трогает сеть, логирует и притворяется успехом."""
+
+
+class DryRunLmsClient:
+    """DRY_RUN=true: не трогает сеть, логирует и притворяется успехом."""
+```
+
+- [x] `run()`: `while not self._stop_event.is_set(): try: self._pipeline.run_cycle() except Exception: logger.exception(...); self.last_scan_at = datetime.now(UTC); self._wake_event.wait(timeout=self._scan_interval_seconds); self._wake_event.clear()`.
+- [x] `request_rescan()` / `stop()` — оба просто `self._wake_event.set()` (`stop()` дополнительно `self._stop_event.set()`).
+- [x] `DryRunS3Gateway.upload_video/put_manifest` — `logger.info(...)`, ничего не возвращают; `verify` — `logger.info(...)`, `return True`.
+- [x] `DryRunLmsClient.register` — `logger.info(...)`, ничего не возвращает.
+- [x] Оба dry-run класса — `close(self) -> None: pass`.
+
+### 10.2 `main()` — сборка зависимостей
+
+Порядок (решения 8–9):
+
+1. `settings = Settings()`.
+2. `configure_logging(settings)`.
+3. `groups_config = load_groups(settings.groups_file)`.
+4. `repo = StateRepository(settings.data_dir / "state.db")`.
+5. `events = EventBus()` (подписчиков сейчас нет — `TelegramNotifier` отложен, этап 9; шина всё равно нужна `Pipeline`).
+6. `scanner`, `stability`, `date_extractors`, `resolver`, `key_builder` — как в тестовых хелперах `tests/test_pipeline.py` (`make_pipeline`), только с реальными значениями из `settings`.
+7. `s3 = DryRunS3Gateway() if settings.dry_run else S3Gateway(...)`; аналогично `lms`.
+8. `pipeline = Pipeline(scanner=..., stability=..., repo=repo, date_extractors=[...], resolver=resolver, key_builder=key_builder, s3=s3, lms=lms, events=events, bucket=settings.s3_bucket, archive_subdir=settings.archive_subdir, archive_after_register=settings.archive_after_register, max_attempts=settings.max_attempts, skip_older_than_days=settings.skip_older_than_days, dry_run=settings.dry_run)`.
+9. `worker = ScanWorker(pipeline, settings.scan_interval_seconds)`; `worker_thread = threading.Thread(target=worker.run, name="scan-worker")`; `worker_thread.start()`.
+10. `app = create_app(repo=repo, worker=worker)`.
+11. `try: uvicorn.run(app, host="0.0.0.0", port=settings.api_port) finally: worker.stop(); worker_thread.join(); s3.close(); lms.close()`.
+
+- [x] `def main() -> None:` без параметров.
+- [x] Секреты разворачиваются здесь и только здесь: `settings.s3_secret_key.get_secret_value()`, `settings.lms_hmac_secret.get_secret_value()`.
+- [x] **Найдено mypy (не было в постановке):** `Settings()` без аргументов требовал плагин `pydantic.mypy` — добавлен в `[tool.mypy] plugins` (`pyproject.toml`); без него mypy не понимает, что поля читаются из env, и требует их как обязательные параметры конструктора.
+- [x] **Найдено mypy:** `date_extractors` без явной аннотации схлопывался в `list[object]` — добавлена `list[DateExtractor]`.
+- [x] **Реальный пробел в `S3Gateway` (этап 6):** у класса не было `close()` вообще, хотя `boto3`-клиент его поддерживает (закрывает пул соединений). Добавлен `S3Gateway.close()` — небольшая, но настоящая правка уже закрытого этапа.
+- [x] **Устаревший тест:** `tests/test_scaffold.py::test_entry_point_stub` проверял, что `main()` бросает `NotImplementedError` (заглушка этапа 1). Заменён на `test_main_fails_fast_without_required_settings` — доказывает fail-fast (`ValidationError` от pydantic) без обязательных переменных окружения, не трогая сеть/потоки.
+
+### 10.3 `api/app.py`
+
+```python
+class ScanWorkerLike(Protocol):
+    """Узкий интерфейс воркера, который нужен API — не импортирует ScanWorker из main.py."""
+
+    last_scan_at: datetime | None
+
+    def request_rescan(self) -> None: ...
+
+
+def create_app(*, repo: StateRepository, worker: ScanWorkerLike) -> FastAPI:
+    """Три эндпоинта; вся логика — прямые вызовы repo/worker, без бизнес-правил."""
+```
+
+- [x] `GET /health` → `{"status": "ok", "last_scan_at": worker.last_scan_at.isoformat() if worker.last_scan_at else None}`.
+- [x] `GET /status` → `{"counts": repo.count_by_status(), "recent": repo.get_recent(20)}` — `FileState` сериализуется FastAPI сам через `jsonable_encoder`.
+- [x] `POST /rescan` → `worker.request_rescan()`; `return {"status": "triggered"}`.
+- [x] Все три — обычные `def`, не `async def`.
+- [x] Аутентификации нет.
+
+### 10.4 Тесты
+
+`tests/test_main.py` (11 тестов):
+- [x] `run()` в фоновом потоке + `stop()` → поток завершается (`join(timeout=...)`, `is_alive() is False`).
+- [x] `request_rescan()` прерывает `wait()` немедленно (< 1 с при `scan_interval_seconds=60`).
+- [x] `last_scan_at` обновляется после каждого цикла.
+- [x] Исключение из `pipeline.run_cycle()` не убивает поток — следующий цикл происходит.
+- [x] `DryRunS3Gateway`/`DryRunLmsClient`: методы не бросают, `verify()` возвращает `True`, `close()` не бросает.
+
+`tests/api/test_app.py` (6 тестов, `fastapi.testclient.TestClient`, `StateRepository` настоящий на `tmp_path`, воркер — лёгкий тестовый дубль):
+- [x] `GET /health` без предшествующих циклов → `last_scan_at: null`; после — `.isoformat()`.
+- [x] `GET /status` → `counts`/`recent` соответствуют состоянию `StateRepository`; `recent` ограничен 20 записями.
+- [x] `POST /rescan` → `200 {"status": "triggered"}`, `request_rescan()` вызван ровно один раз.
+
+### Definition of Done (этап 10)
+
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 221/221 тестов.
+- [x] **Ручная проверка выполнена по-настоящему** (не просто curl `/health`): `uv run video-uploader` с `DRY_RUN=true` в фоне — поднялся, `/health`/`/status`/`/rescan` ответили. Добавлен реальный видеофайл (стабильный по mtime) в тестовую папку группы → `POST /rescan` → `GET /status` показал полный проход `discovered → uploaded → registered` (dry-run, без архивации, файл остался на месте — ровно как задумано решением этапа 8). Проверены логи (`RotatingFileHandler`, кириллица в путях через `encoding="utf-8"` — без искажений). `kill -TERM` → uvicorn корректно поймал сигнал, лог показал `Shutting down → Application shutdown complete → Finished server process`, порт освобождён, процесс полностью завершился (значит `worker_thread.join()` в `finally` тоже отработал, не завис).
+- [x] Ревью Claude пройдено (код и тесты написаны Claude по вашей просьбе).
+- [ ] Коммит — на вашей стороне.
+
+---
+
+## Этап 11 — Поставка (Docker, README, smoke-скрипт, документация) ← ТЕКУЩИЙ
+
+**Цель:** последний этап — код пайплайна больше не меняется (этапы 2–10 закрыты). Здесь только упаковка: `Dockerfile`, `docker-compose.yml`, ручной `scripts/smoke_s3.py`, и документация (`README.md`, `.docs/basic_doc.md`, `.docs/API_doc.md`). Решать почти нечего — форма Docker-сборки и compose уже полностью специфицирована в CLAUDE.md (раздел Runtime Environment), это транскрипция, не проектирование.
+
+**Затрагиваемые файлы:** `Dockerfile`, `docker-compose.yml`, `.dockerignore` (не было — нужен для чистого build context), `scripts/smoke_s3.py`, `README.md`, `.docs/basic_doc.md`, `.docs/API_doc.md`.
+
+### Решения
+
+1. **Multi-stage `Dockerfile`**: builder-этап (`uv sync --frozen --no-dev`, сначала только `pyproject.toml`+`uv.lock` для кэша слоя зависимостей, потом код) → финальный этап копирует `.venv` + `video_uploader/` от непривилегированного пользователя `uid 1000`. Оба этапа — на `ghcr.io/astral-sh/uv:python3.12-bookworm-slim`, как явно указано в CLAUDE.md.
+2. **`HEALTHCHECK` — в `docker-compose.yml`, не в `Dockerfile`.** CLAUDE.md перечисляет его именно в bullet про docker-compose («TZ=...; restart: unless-stopped; HEALTHCHECK → GET /health»), Dockerfile-bullet про него не упоминает. Через `python -c "...urllib.request..."`, не `curl` — на `bookworm-slim` curl не гарантирован, python есть точно (это python-образ).
+3. **`ports:` в compose — добавляю, хотя CLAUDE.md явно не перечисляет** (только тома/TZ/restart/healthcheck): без публикации порта `API_PORT` наружу LXC HTTP API недостижим даже из «Tech/Admin-сегмента», а CLAUDE.md прямо говорит, что доступ оттуда должен быть. Если не согласны — уберу, `HEALTHCHECK` при этом всё равно работает (он бьёт внутри контейнерной сети, порт наружу не нужен).
+4. **`env_file: .env` в compose**, а не построчный `environment:` на 20+ переменных — тот самый `.env`, что рядом с `docker-compose.yml` (создаётся из `.env.example`), автоматически и для подстановки `${TZ_NAME}` в самом YAML, и для инъекции всех переменных в контейнер.
+5. **`scripts/smoke_s3.py` — не часть пакета, не под pytest**, обычный скрипт вне `mypy --strict`/CI-гейта (CLAUDE.md: «вне pytest»). Читает `Settings()`, поднимает `S3Gateway` как в `main.py`, грузит маленький тестовый объект под префиксом `smoke-test/`, проверяет `verify()`, кладёт манифест, затем удаляет тестовый объект напрямую через `boto3` (у `S3Gateway` нет и не должно быть `delete` — сервис в рантайме никогда не удаляет; это ограничение про исходники на шаре, не про тестовые объекты в S3, поэтому в ad hoc-скрипте прямой `delete_object` уместен).
+6. **`.dockerignore`** — исключает то же, что и `.gitignore` (venv/кеши/IDE), плюс `.git/`, `tests/`, `.docs/` — тестам и документации незачем попадать в build context прод-образа.
+
+### 11.1 `Dockerfile`
+
+- [x] Builder-стадия: `WORKDIR /app`; сначала `COPY pyproject.toml uv.lock ./`, `uv sync --frozen --no-dev --no-install-project` (кэш зависимостей отдельным слоем); затем `COPY video_uploader ./video_uploader` + `README.md`, `uv sync --frozen --no-dev`.
+- [x] Финальная стадия: тот же базовый образ; `groupadd`+`useradd --uid 1000 --create-home --shell /usr/sbin/nologin appuser`; `COPY --from=builder --chown=appuser:appuser /app /app`; `USER appuser`; `ENV PATH="/app/.venv/bin:$PATH"`; `CMD ["video-uploader"]`.
+
+### 11.2 `docker-compose.yml`
+
+- [x] `services.video-uploader`: `build: .`; `restart: unless-stopped`; `env_file: .env`; `environment: TZ: ${TZ_NAME:-Europe/Kaliningrad}`; `volumes: /mnt/video:/mnt/video, ./data:/data, ./config:/app/config:ro`; `ports: "${API_PORT:-8090}:8090"`; `healthcheck` через `python -c "...urlopen('http://localhost:'+os.environ.get('API_PORT','8090')+'/health')..."`.
+- [x] Синтаксис проверен `docker compose config` — валиден, все подстановки резолвятся.
+
+### 11.3 `.dockerignore`
+
+- [x] `.git/`, `.github/`, `.claude/`, `.docs/`, `.idea/`, `tests/`, `__pycache__/`, `*.py[cod]`, `.venv/`, `dist/`, `build/`, `*.egg-info/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `.env`, `data/`, `.DS_Store`.
+
+### 11.4 `scripts/smoke_s3.py`
+
+- [x] `Settings()` → `S3Gateway(...)` (реальные креды из `.env`, не dry-run); ключ `f"smoke-test/{uuid4().hex}.txt"`; `upload_video`/`put_manifest`/`verify` с маленьким временным файлом (`tempfile`); печать результата на каждом шаге; `delete_object` в конце напрямую через `boto3.client("s3", ...)` с теми же параметрами подключения (и для видео-ключа, и для манифест-ключа).
+- [x] `if __name__ == "__main__":` — не в `[project.scripts]`, запускается `uv run python scripts/smoke_s3.py`.
+- [x] `ruff`/`mypy` чистые и на этом файле (хотя формально вне обязательного гейта `mypy video_uploader`).
+
+### 11.5 Документация
+
+- [x] `.docs/basic_doc.md` — структура проекта, технологии (где/почему), паттерны (где/почему), сводка по доработке (каналы логирования, новые папки сканирования, другое хранилище), как пользоваться (настройки, деплой, S3-ключи, интеграция LMS). **Заполнено напрямую** (документация, не код — не требует цикла постановка → пишете сами).
+- [x] `.docs/API_doc.md` — все три HTTP-эндпоинта сервиса с примерами запрос/ответ. **Заполнено напрямую**, на основе реального ручного прогона с этапа 10.
+
+### Definition of Done (этап 11)
+
+- [ ] **`docker compose build`/`up` — НЕ проверено.** В этой рабочей среде демон Docker не запущен (`Cannot connect to the Docker daemon`) — реальную сборку и `GET /health` из контейнера проверить не удалось технически. Проверена только валидность `docker-compose.yml` (`docker compose config` — чисто, все подстановки резолвятся). **Нужна ваша проверка** реальной сборки на машине с работающим Docker, прежде чем считать этап полностью закрытым.
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 221/221 тестов (новые файлы вне `video_uploader/` гейт не задели).
+- [x] JSON-примеры в `.docs/API_doc.md`/`.docs/basic_doc.md` проверены программно на валидность (`json.loads` по всем блокам) — нашёл и поправил одну свою опечатку (`245_681_302` — синтаксис Python, не JSON).
+- [x] Ревью Claude пройдено (код и документация написаны Claude по вашей просьбе).
+- [ ] Коммит — на вашей стороне.
