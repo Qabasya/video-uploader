@@ -1,5 +1,6 @@
 """Тесты Pipeline: happy path и все ветки отказов (CLAUDE.md, раздел Testing)."""
 
+import logging
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -135,7 +136,9 @@ def only_record_id(repo: StateRepository) -> int:
 
 
 class TestHappyPath:
-    def test_file_reaches_archived(self, video_root: Path, repo: StateRepository) -> None:
+    def test_file_reaches_archived(
+        self, video_root: Path, repo: StateRepository, caplog: pytest.LogCaptureFixture
+    ) -> None:
         s3 = FakeS3Gateway()
         lms = FakeLmsClient()
         events = EventBus()
@@ -147,7 +150,14 @@ class TestHappyPath:
         write_stable_file(video_path)
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events)
 
-        pipeline.run_cycle()
+        with caplog.at_level(logging.INFO, logger="video_uploader.pipeline"):
+            pipeline.run_cycle()
+
+        # успешные шаги должны попадать в логи (канал Loki) — не только в EventBus
+        info_messages = [r.message for r in caplog.records if r.levelname == "INFO"]
+        assert any("загружено" in m for m in info_messages)
+        assert any("зарегистрировано" in m for m in info_messages)
+        assert any("архив" in m for m in info_messages)
 
         state = repo.get_by_id(only_record_id(repo))
         assert state is not None
@@ -194,7 +204,9 @@ class TestStability:
 
 
 class TestGroupUnmapped:
-    def test_rate_limited_once_per_cycle(self, video_root: Path, repo: StateRepository) -> None:
+    def test_rate_limited_once_per_cycle(
+        self, video_root: Path, repo: StateRepository, caplog: pytest.LogCaptureFixture
+    ) -> None:
         s3 = FakeS3Gateway()
         lms = FakeLmsClient()
         events = EventBus()
@@ -207,12 +219,14 @@ class TestGroupUnmapped:
         pipeline = make_pipeline(
             video_root, repo, s3=s3, lms=lms, events=events, groups={"groups": {}}
         )
-        pipeline.run_cycle()
+        with caplog.at_level(logging.WARNING, logger="video_uploader.pipeline"):
+            pipeline.run_cycle()
 
         assert len(unmapped) == 1
         records = repo.get_recent(10)
         assert len(records) == 2
         assert all(record.status == "skipped_unmapped" for record in records)
+        assert caplog.text.count("НЕИЗВЕСТНАЯ") == 1  # WARNING тоже раз за цикл на папку
 
     def test_reopens_after_config_fixed(self, video_root: Path, repo: StateRepository) -> None:
         s3 = FakeS3Gateway()
@@ -258,7 +272,9 @@ class TestSkipOlderThanDays:
 
 
 class TestDateFallback:
-    def test_event_published_and_date_used(self, video_root: Path, repo: StateRepository) -> None:
+    def test_event_published_and_date_used(
+        self, video_root: Path, repo: StateRepository, caplog: pytest.LogCaptureFixture
+    ) -> None:
         s3 = FakeS3Gateway()
         lms = FakeLmsClient()
         events = EventBus()
@@ -269,12 +285,15 @@ class TestDateFallback:
         write_stable_file(video_path)
 
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events)
-        pipeline.run_cycle()
+        with caplog.at_level(logging.WARNING, logger="video_uploader.pipeline"):
+            pipeline.run_cycle()
 
         assert len(fallback_events) == 1
         assert fallback_events[0].path == video_path
         assert len(s3.manifest_calls) == 1
         assert "recorded_at" in s3.manifest_calls[0][1]
+        assert "random_name.webm" in caplog.text
+        assert any(record.levelname == "WARNING" for record in caplog.records)
 
 
 class TestUploadFailure:
