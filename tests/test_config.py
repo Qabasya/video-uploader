@@ -12,6 +12,7 @@ REQUIRED = {
     "s3_access_key": "access-key",
     "s3_secret_key": "top-secret",
     "lms_base_url": "http://lms.local",
+    "lms_hmac_secret": "hmac-secret",
 }
 
 
@@ -41,7 +42,13 @@ class TestDefaults:
         with pytest.raises(ValidationError) as exc_info:
             Settings(_env_file=None)
         missing = {error["loc"][0] for error in exc_info.value.errors()}
-        assert missing == {"s3_bucket", "s3_access_key", "s3_secret_key", "lms_base_url"}
+        assert missing == {
+            "s3_bucket",
+            "s3_access_key",
+            "s3_secret_key",
+            "lms_base_url",
+            "lms_hmac_secret",
+        }
 
 
 class TestEnvSource:
@@ -60,6 +67,7 @@ class TestEnvSource:
             "S3_ACCESS_KEY": "env-key",
             "S3_SECRET_KEY": "env-secret",
             "LMS_BASE_URL": "http://env-lms",
+            "LMS_HMAC_SECRET": "env-hmac-secret",
         }.items():
             monkeypatch.setenv(name, value)
         settings = Settings(_env_file=None)

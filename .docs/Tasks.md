@@ -85,7 +85,7 @@
 
 ### 2.1 `Settings` (config.py)
 
-- [ ] Все переменные таблицы Configuration CLAUDE.md (+ `DRY_RUN`, − `LMS_DRY_RUN`) как поля `Settings(BaseSettings)`; источник — env и `.env` (`SettingsConfigDict(env_file=".env")`). ⚠️ Осталось: `LMS_UPLOADER_TOKEN` (обязательный `SecretStr`), `TELEGRAM_BOT_TOKEN` (`SecretStr | None`) — отложены Даниилом сознательно; при добавлении дополнить `_empty_str_to_none` (telegram) и тест `test_required_fields_reported`.
+- [ ] Все переменные таблицы Configuration CLAUDE.md (+ `DRY_RUN`, − `LMS_DRY_RUN`) как поля `Settings(BaseSettings)`; источник — env и `.env` (`SettingsConfigDict(env_file=".env")`). ⚠️ Осталось: `TELEGRAM_BOT_TOKEN` (`SecretStr | None`) — отложен Даниилом сознательно, дополнить `_empty_str_to_none` и `test_required_fields_reported` при добавлении. `LMS_UPLOADER_TOKEN` закрыт этапом 8.1 — контракт LMS сменился на HMAC (`LMS_HMAC_SECRET`, `SecretStr`, обязательный), переименовывать в коде было нечего, добавлен сразу под новым именем.
 - [x] Типы: пути — `Path`; числа — `int` с ограничениями; флаги — `bool`; секреты — `SecretStr`.
 - [x] `ALLOWED_EXTENSIONS`: строка «через запятую» → нормализованный кортеж (`NoDecode` + before-валидатор).
 - [x] `TZ_NAME` валидируется через `zoneinfo`; default — `Europe/Kaliningrad` (решение Даниила, CLAUDE.md синхронизирован).
@@ -666,4 +666,343 @@ scan → stability → dedup (реестр) → metadata (дата) → resolve 
 - [x] Ревью Claude пройдено. Найдено и исправлено два реальных бага при написании тестов:
   1. **`pipeline.py`** — `mark_registered` мог упасть `InvalidTransitionError` при ретрае после падения именно на шаге `register` (не `upload`): `mark_failed` перезатирал статус `uploaded → failed`, а таблица переходов не пускает `failed → registered` напрямую. Исправлено: если `s3_key` уже есть, а текущий статус `failed` — сначала технически восстанавливаем `uploaded` (`mark_uploading` + `mark_uploaded`, без единого сетевого вызова), только потом `mark_registered`.
   2. **`tests/test_pipeline.py`** — в `FakeS3Gateway.upload_video` вызов записывался в `upload_calls` *после* проверки на ошибку, из-за чего падающие попытки не попадали в счётчик. Поменял порядок: сначала фиксируем вызов, потом решаем, бросать исключение или нет.
+- [ ] Коммит — на вашей стороне.
+
+---
+
+## Этап 8.1 — HMAC-аутентификация LMS (правки по контракту fs-lms) ← ТЕКУЩИЙ
+
+**Контекст:** вы обновили CLAUDE.md (раздел «TODO интеграции с fs-lms», строки 306+) по итогам согласования с плагином (ветка `stage_11`, контракт `FS_LMS_API.md`). Статический токен `X-FS-Uploader-Token` заменён на HMAC-подпись (та же схема, что у модуля AdSync), плюс плагин теперь возвращает поле `matched` в ответе. Это не новый шаг пайплайна — правки точечные, в уже написанном коде этапов 2 и 7. `pipeline.py` не трогаем: REST-payload и Protocol `RegistrationClient` не изменились, меняется только *механика аутентификации* внутри `LmsClient`.
+
+**Затрагиваемые файлы:** `video_uploader/lms/client.py`, `video_uploader/config.py`, `.env.example`, `config/groups.yaml.example`, `tests/lms/test_client.py`, `tests/test_config.py`, `tests/test_groups.py` (один тест на новый реальный кейс).
+
+### Решения
+
+1. **`raw_body` — сериализуем JSON один раз, переиспользуем для подписи и отправки.** Критично: если `httpx` пересериализует payload сам (через `json=`), байты подписи и байты тела могут разойтись (другой порядок ключей/пробелы) — плагин пересчитает HMAC от полученных байт и получит несовпадение → `401`. Поэтому `self._client.post(..., content=raw_body, ...)`, не `json=payload`; `Content-Type: application/json` выставляется вручную в заголовках запроса (при `content=` `httpx` его сам не проставляет, в отличие от `json=`).
+2. **Сообщение для HMAC — конкатенация байтов, не строк**: `f"{timestamp}.".encode("ascii") + raw_body`, эквивалентно `"{timestamp}.{raw_body}"` из контракта, но без риска мисматча кодировки при склейке `str` и `bytes`.
+3. **Таймстамп — `int(time.time())` прямо в `register()`**, без инъекции часов через конструктор: тесты пересчитывают ожидаемую подпись из **фактически отправленного** `X-Fs-Timestamp` (перехваченного через `httpx.MockTransport`), а не мокают время. Проще, чем городить `Clock`-протокол ради одного метода.
+4. **`matched: false` — не исключение**, а `logger.warning(...)` внутри `register()` после успешного статуса; сам факт успеха (`return` без ошибки) не меняется — CLAUDE.md прямо говорит «для сервиса оба случая = registered». Тело ответа парсится в `try/except ValueError` (`response.json()` бросает `json.JSONDecodeError`, это подкласс `ValueError`) — если плагин однажды пришлёт `200` без валидного JSON, не должны с этого падать, раз статус уже говорит об успехе.
+5. **`lms_hmac_secret: SecretStr` — обязательное поле** (без default), тем же паттерном, что `s3_secret_key`: это и был исходный план для LMS-секрета ещё на этапе 2.1, до того как вы сознательно отложили его добавление. Теперь добавляем сразу под правильным именем — переименовывать в коде нечего.
+6. **`GroupResolver`/`GroupEntry`/`GroupsConfig` не переименовываем.** CLAUDE.md прямо говорит: «Сервис папки не различает — семантику задаёт состав `lms`-блока в конфиге», и пункт 5 TODO подтверждает «кода это не требует». Переименование устоявшихся классов ради терминологии («группа» → «папка/сущность») — не запрошено и добавило бы churn без функциональной пользы.
+
+### 8.1.1 `LmsClient` (lms/client.py) — переписать аутентификацию
+
+```python
+def __init__(self, base_url: str, hmac_secret: str, *, transport: httpx.BaseTransport | None = None) -> None:
+    """httpx.Client без постоянных заголовков — HMAC считается заново на каждый запрос."""
+
+def register(self, payload: dict[str, object]) -> None:
+    """Сериализует payload один раз, подписывает те же байты, шлёт их же."""
+
+def _sign(self, timestamp: int, raw_body: bytes) -> str:
+    """hex(hmac_sha256(f"{timestamp}." + raw_body, hmac_secret))."""
+```
+
+- [x] Конструктор: параметр `token: str` → `hmac_secret: str`; `httpx.Client` больше не получает `headers={...}` при создании (HMAC-заголовки — per-request, не постоянные).
+- [x] `register`: `raw_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")`; `timestamp = int(time.time())`; `signature = self._sign(timestamp, raw_body)`; заголовки `{"X-Fs-Timestamp": str(timestamp), "X-Fs-Signature": signature, "Content-Type": "application/json"}`; `self._client.post(_ENDPOINT_PATH, content=raw_body, headers=headers)`.
+- [x] Классификация ответа — **без изменений** (200/201 успех, 5xx retryable, прочие 4xx rejected); на успехе — новый вызов `_log_match_status(response)` перед `return`.
+- [x] `_log_match_status(response)` — `try: data = response.json() except ValueError: return`; если `isinstance(data, dict) and data.get("matched") is False` → `logger.warning(...)`.
+- [x] `close()` — без изменений.
+
+### 8.1.2 `config.py`
+
+- [x] `lms_hmac_secret: SecretStr` — обязательное поле, рядом с `s3_secret_key` в блоке «Секреты».
+- [x] Обновить тест `test_required_fields_reported` в `tests/test_config.py` — теперь 5 обязательных полей, не 4.
+- [x] Добавить `lms_hmac_secret` в хелпер `REQUIRED`/`_make_settings` в `tests/test_config.py`, иначе все существующие тесты `Settings` перестанут собираться.
+
+### 8.1.3 `.env.example`
+
+- [x] `LMS_UPLOADER_TOKEN=` → `LMS_HMAC_SECRET=`, комментарий — «Секрет HMAC-подписи (= `FS_LMS_VIDEO_HMAC_SECRET` в wp-config плагина)».
+
+### 8.1.4 `config/groups.yaml.example`
+
+- [x] Добавить пример персональной папки преподавателя (`"Индивидуальные-Петров"` → `lms: {teacher_username: "i.petrov"}`, без `group_id`), с комментарием про две ветки резолва на стороне плагина (по составу `lms`-блока) — как в примере CLAUDE.md.
+
+### 8.1.5 Тесты
+
+`tests/lms/test_client.py` — переписать под HMAC (статический токен и его заголовок больше не существуют):
+- [x] Заголовки `X-Fs-Timestamp`/`X-Fs-Signature` присутствуют в запросе; `X-Fs-Timestamp` — целое число, близкое к текущему времени (например, `abs(int(request.headers["X-Fs-Timestamp"]) - time.time()) < 5`).
+- [x] Подпись валидна: пересчитать `hmac_sha256(f"{ts}.".encode() + request.content, secret)` из перехваченного запроса и сверить с `X-Fs-Signature`.
+- [x] `Content-Type: application/json` присутствует.
+- [x] Тело запроса, декодированное из `request.content`, равно исходному payload (побайтовое соответствие тому, что ушло на подпись, — не косвенно через `json=`).
+- [x] 200 с `{"ok": true, "matched": true, ...}` → `register()` не бросает, `caplog` **не** содержит WARNING про непривязанное занятие.
+- [x] 200 с `{"matched": false, ...}` → не бросает, но `caplog` содержит WARNING.
+- [x] 200 с невалидным JSON-телом → не бросает (ответ уже успешный по статусу, парсинг `matched` — best-effort).
+- [x] Существующие тесты классификации (500/503 → `LmsRetryableError`, 400/404/422 → `LmsRejectedError`, сетевая ошибка, `close()`) — актуализировать под новую сигнатуру `LmsClient(base_url, hmac_secret, transport=...)`, поведение не меняется.
+
+`tests/test_groups.py`:
+- [x] Один новый тест: `lms: {teacher_username: "i.petrov"}` без `group_id` — валидируется как обычная запись (документирует реальный кейс из обновлённого CLAUDE.md; код уже поддерживает это без изменений — `lms`-блок opaque).
+
+### Definition of Done (этап 8.1)
+
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто.
+- [x] Ревью Claude пройдено, замечания закрыты.
+- [ ] Коммит — на вашей стороне.
+
+### Не код (зафиксировано для памяти, не задача этого репозитория)
+
+- **NTP** (пункт 4 TODO CLAUDE.md): часы LXC должны быть синхронизированы — окно HMAC ±300 c, рассинхрон часов → `401`. Это настройка хоста (`chrony`/`systemd-timesyncd`), проверить при деплое на этапе 11 (поставка), не задача кода.
+- **Процесс** (пункт 7 TODO): завести персональные папки преподавателей на шаре (`Sync-VideoGroups.ps1`/вручную) и согласовать с преподавателями, что индивидуальные записи кладутся в личную папку — организационная договорённость, не код.
+
+---
+
+## Этап 9 — Логи и уведомления
+
+**Цель:** `logging.Handler`-стратегии, фабрика, собирающая их из `Settings`. Ключевое эргономическое требование (по вашей просьбе): после того как фабрика один раз настроит логгер `video_uploader` в `main.py` (этап 10), **любой код в любом модуле** логирует куда угодно просто через `logging.getLogger(__name__)` + `.info()/.warning()/.error()` — без импорта чего-либо из `logging_setup`. Это и есть «удобно и универсально»: не новый API, а корректно настроенная стандартная иерархия логгеров stdlib.
+
+**⚠️ Скоуп изменён по ходу этапа (2026-07-17).** Изначально планировались три хендлера (file/loki/telegram) и `TelegramNotifier`-подписчик `EventBus` для бизнес-уведомлений. **Вы приняли архитектурное решение отказаться от прямой Telegram-интеграции в этом сервисе**: Telegram-бот (и любые другие боты) будете делать отдельным сервисом на `aiogram`, вне этого репозитория. **Loki становится основным каналом** для такого бота — он будет читать события из Loki, а не получать вебхуки/push от `fs-video-uploader` напрямую. Соответственно:
+- `logging_setup/telegram.py` (`TelegramLogHandler`) и `notifications/telegram.py` (`TelegramNotifier`) — **возвращены в состояние заглушки**, реализация отменена. `TELEGRAM_BOT_TOKEN` в `Settings` не добавляется. Обе заглушки помечены докстрингом «отложено 2026-07-17», чтобы будущая сессия понимала, что это осознанный откат, а не недоделанный этап 9.
+- Обсуждали и вариант push-вебхука от `EventBus`-подписчика к боту (симметрично `lms/client.py`) — вы явно предпочли poll/read-из-Loki, вебхук не делаем.
+
+**Найденный по ходу этапа пробел (не связан с решением про Telegram, актуален независимо):** `pipeline.py` публиковал события `GroupUnmapped`/`DateFallback` в `EventBus`, но **не логировал** их через `logging` — а CLAUDE.md прямо требует WARNING-уровень для обоих. Без лога они не долетали ни до файла, ни (что стало важно сегодня) до Loki. Исправлено. Заодно — по вашему решению сделать Loki основным каналом — добавлены INFO-логи на успешные шаги (`VideoUploaded`/`VideoRegistered`/`VideoArchived`), которых раньше не было вовсе (эти события тоже раньше жили только в `EventBus`, без следа в `logging`).
+
+**Затрагиваемые файлы (по факту):** `video_uploader/logging_setup/loki.py`, `video_uploader/logging_setup/factory.py`, `video_uploader/pipeline.py` (точечные логи), `tests/logging_setup/test_loki.py`, `tests/logging_setup/test_factory.py`, правки в `tests/test_pipeline.py`.
+
+### Решения
+
+1. **Loki — основной канал наблюдаемости; Telegram/другие боты — читатели Loki, не получатели push от этого сервиса.** Ваше решение 2026-07-17, отменяет исходные пункты 1–2 постановки (выбор события для бизнес-уведомления, наполнение текста) — они больше не применимы, Telegram-уведомления из этого репозитория не отправляются.
+2. **Один HTTP-запрос на запись, без батчинга** — в `LokiHandler`. Сервис фоновый, малый объём логов — батчинг с таймером флаша добавил бы сложность без реальной пользы на этом масштабе.
+3. **Ошибки внутри `logging.Handler.emit()` — через `self.handleError(record)`**, стандартный механизм stdlib `logging`, а не собственный `try/except` с `logger.exception` (риск зацикливания — хендлер логирования сам логирует свою поломку тем же логированием).
+4. **`configure_logging(settings)` вешает хендлеры на логгер `"video_uploader"`, не на root**, и выставляет `propagate = False`. Так сторонние библиотеки (`boto3`, `httpx`, `sqlalchemy`) не заваливают наши синки своим внутренним логом, и нет риска задвоения, если что-то ещё (например, `uvicorn`) сконфигурирует root-логгер по-своему.
+5. **Уровень логгера `"video_uploader"` — `INFO` захардкожен**, не новая переменная `Settings`: в таблице Configuration `LOG_LEVEL` нет, заводить новую настройку без запроса не буду.
+6. **`LokiHandler` получает `transport: httpx.BaseTransport | None = None`** — та же точка тестовой подмены сети, что уже была у `LmsClient` (этап 7): штатный механизм `httpx`, не monkeypatch.
+7. **INFO-логи успешных шагов и WARNING для `GroupUnmapped`/`DateFallback` — прямо рядом с `events.publish(...)` в `pipeline.py`**, не через отдельного generic-подписчика «событие → лог». `EventBus` и `logging` — параллельные, независимые каналы с разными потребителями (уведомления vs наблюдаемость); подмешивать один в другой через дополнительную абстракцию не было запрошено, а прямой вызов `logger.info/warning` рядом с местом действия — ровно то же самое, что уже сделано для `logger.exception` в `_fail`.
+
+### 9.1 `LokiHandler` (logging_setup/loki.py)
+
+- [x] `__init__(self, url: str, *, transport: httpx.BaseTransport | None = None)`.
+- [x] `emit`: `{"streams": [{"stream": {"service": "fs-video-uploader", "level": record.levelname, "logger": record.name}, "values": [[str(int(record.created * 1e9)), self.format(record)]]}]}` → `POST /loki/api/v1/push`; `try/except httpx.HTTPError: self.handleError(record)`.
+- [x] Таймаут запроса — 5 с, константа модуля.
+- [x] `close()` — закрывает `httpx.Client`, затем `super().close()`.
+
+### 9.2 `TelegramLogHandler` (logging_setup/telegram.py) — отменено, см. врезку выше
+
+- [x] Возвращён в состояние заглушки с докстрингом «отложено 2026-07-17».
+
+### 9.3 `logging_setup/factory.py`
+
+- [x] `logger = logging.getLogger("video_uploader")`; `setLevel(logging.INFO)`; `propagate = False`; `handlers.clear()` (идемпотентность).
+- [x] file: `(settings.data_dir / "logs").mkdir(parents=True, exist_ok=True)`; `RotatingFileHandler(..., maxBytes=10*1024*1024, backupCount=5, encoding="utf-8")`; `Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s")`.
+- [x] loki: `if settings.loki_url is not None:` → `LokiHandler(settings.loki_url)` с тем же форматтером.
+- [x] Telegram-ветка удалена (решение 1).
+
+### 9.4 `TelegramNotifier` (notifications/telegram.py) — отменено, см. врезку выше
+
+- [x] Возвращён в состояние заглушки с докстрингом «отложено 2026-07-17».
+
+### 9.5 `config.py` / `.env.example`
+
+- [x] `telegram_bot_token` **не добавлен** — решение 1, больше не нужен этому сервису.
+
+### 9.6 `pipeline.py` — недостающие логи (найдено по ходу этапа)
+
+- [x] `DateFallback`: `logger.warning("дата занятия не найдена в имени файла, взят mtime: %s", video_file.path)` перед `events.publish(...)`.
+- [x] `GroupUnmapped`: `logger.warning("папка отсутствует в groups.yaml: %s", video_file.group_folder)` перед `events.publish(...)` — внутри того же `if ... not in warned_folders`, так что тоже не чаще раза за цикл на папку.
+- [x] `VideoUploaded`: `logger.info("видео загружено: %s -> %s", video_file.path, s3_key)` — и в основном потоке, и в `_replay_duplicate` (с пометкой «дубликат по контенту» в тексте).
+- [x] `VideoRegistered`: `logger.info("видео зарегистрировано в LMS: %s -> %s", ...)` — аналогично, оба места.
+- [x] `VideoArchived`: `logger.info("исходник перемещён в архив: %s -> %s", video_file.path, target)`.
+
+### 9.7 Тесты
+
+`tests/logging_setup/test_loki.py` (7 тестов, `httpx.MockTransport`, тот же подход, что у `LmsClient`):
+- [x] Форма push-запроса (`streams[0].stream` — `service`/`level`/`logger`; `values[0]` — `(timestamp_ns, formatted_line)`).
+- [x] Кастомный `Formatter`, если задан через `setFormatter`, реально используется в `values[0][1]`.
+- [x] Сетевая ошибка не поднимает исключение из `emit()`.
+- [x] Сетевая ошибка вызывает именно `self.handleError(record)` (проверено через `monkeypatch.setattr` на сам метод хендлера).
+- [x] `close()` закрывает внутренний `httpx.Client` (`is_closed`).
+
+`tests/logging_setup/test_factory.py` (5 тестов):
+- [x] Только `DATA_DIR` → ровно один хендлер (file, `RotatingFileHandler`).
+- [x] `LOKI_URL` задан → добавлен `LokiHandler`, хендлеров два.
+- [x] Повторный вызов `configure_logging` не удваивает хендлеры.
+- [x] `propagate is False`.
+- [x] Интеграционный тест на саму суть эргономического требования: `logging.getLogger("video_uploader.some.module").info(...)` после `configure_logging(...)` долетает до `DATA_DIR/logs/uploader.log`.
+
+`tests/test_pipeline.py` — три существующих теста дополнены проверками логов (не новые тесты, усилены существующие):
+- [x] `TestGroupUnmapped.test_rate_limited_once_per_cycle` — WARNING с именем папки встречается в `caplog` ровно один раз за цикл (симметрично проверке на само событие).
+- [x] `TestDateFallback.test_event_published_and_date_used` — WARNING с именем файла присутствует.
+- [x] `TestHappyPath.test_file_reaches_archived` — INFO-сообщения на «загружено»/«зарегистрировано»/«архив» присутствуют.
+
+### Definition of Done (этап 9)
+
+- [x] Решение 1 (Loki — основной канал, Telegram отменён в этом репозитории) подтверждено вами.
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 210/210 тестов.
+- [x] Ревью Claude пройдено (код и тесты написаны Claude по вашей просьбе).
+- [x] Коммит — на вашей стороне.
+
+### Не код (важно для будущего aiogram-сервиса, не задача этого репозитория)
+
+- Отдельный сервис на `aiogram` будет читать события из Loki (poll/tail через Loki API), а не получать push от `fs-video-uploader`. Раз так, стоит держать в уме на будущих этапах: тексты в `logger.info/warning(...)` в `pipeline.py` — это теперь не просто диагностика для вас, а фактический источник данных для внешнего потребителя. Если формат текста понадобится менять (например, для более простого парсинга ботом), это тронет уже написанный код `pipeline.py`, а не `logging_setup/`.
+
+---
+
+## Этап 10 — Composition root (main.py + api/app.py) ← ТЕКУЩИЙ
+
+**Цель:** `main.py` собирает все зависимости из `Settings` (единственное место, где создаётся `Settings()`), запускает фоновый воркер сканирования и HTTP API, корректно завершается по SIGTERM. `api/app.py` — тонкий FastAPI-слой поверх `StateRepository`/воркера, без бизнес-логики. Это последний этап, где появляется новый код пайплайна — этап 11 (поставка) уже про Docker/README/smoke-скрипт, не про Python-логику.
+
+**Затрагиваемые файлы:** `video_uploader/main.py`, `video_uploader/api/app.py`, `tests/test_main.py`, `tests/api/test_app.py`. Новых зависимостей не требуется — `fastapi`/`uvicorn` уже в `pyproject.toml` с этапа 1.
+
+### Решения
+
+1. **`uvicorn.run(app, host="0.0.0.0", port=settings.api_port)` блокирует главный поток; воркер — отдельный `threading.Thread`, запущенный ДО вызова `uvicorn.run`.** Порядок ровно как в докстринге заглушки CLAUDE.md: «воркер (фоновый поток) + uvicorn». `host="0.0.0.0"` захардкожен (не новая переменная `Settings` — в таблице Configuration только `API_PORT`, хоста нет): внутри контейнера иначе порт не будет достижим снаружи.
+2. **Graceful shutdown по SIGTERM — не через свой `signal.signal(...)`, а через встроенный механизм uvicorn.** `uvicorn.run()`, вызванный в главном потоке, сам ставит обработчики SIGINT/SIGTERM, аккуратно останавливает HTTP-сервер и **возвращает управление** — сигнал не нужно ловить отдельно. После возврата из `uvicorn.run()` (в `finally`) останавливаем воркер: `worker.stop()` + `worker_thread.join()`. Свой обработчик сигнала здесь избыточен и рискует конфликтовать с uvicorn-овским (Python допускает один обработчик на сигнал).
+3. **`/rescan` не запускает скан напрямую и не ждёт его завершения** — он лишь «будит» воркер (`threading.Event.set()`), прерывая текущий `sleep` между циклами. Единственный поток, который когда-либо вызывает `pipeline.run_cycle()`, — воркер; так гарантированно нет двух параллельных прогонов пайплайна по одной и той же SQLite (репозиторий на это не рассчитан — короткоживущие сессии, но не защита от гонки двух полных циклов одновременно). `POST /rescan` возвращает `{"status": "triggered"}` сразу, не дожидаясь результата — это соответствует слову «триггер» в описании эндпоинта CLAUDE.md.
+4. **`ScanWorker` — отдельный класс внутри `main.py`**, не просто функция: инкапсулирует `stop_event`/`wake_event`/`last_scan_at` и не требует нового файла (Architecture-таблица CLAUDE.md называет только `main.py` для composition root). Публичный интерфейс — `run()` (тело потока), `stop()`, `request_rescan()`, атрибут `last_scan_at: datetime | None`.
+5. **Ошибка целого цикла (не отдельного файла) ловится в `ScanWorker.run()`**, вокруг вызова `pipeline.run_cycle()` — дополнительный внешний защитный слой поверх уже существующей поштучной изоляции файлов внутри `_process`. Причина: `VideoScanner.scan()` может упасть на самом верхнем уровне (`video_root.iterdir()` — решение этапа 4: недоступность `VIDEO_ROOT` не перехватывается специально, «должен упасть»), а раз-два в рантайме SMB-шара может быть недоступна временно — сервис не должен падать целиком, только пропустить цикл и попробовать снова через `SCAN_INTERVAL_SECONDS`. `logger.exception(...)` + продолжение цикла.
+6. **`api/app.py` не импортирует `ScanWorker` из `main.py`.** Обратная зависимость (composition root импортируется тем, что он сам собирает) — архитектурный запах и потенциальный циклический импорт (`main.py` импортирует `create_app` из `api/app.py`, а `api/app.py` импортировал бы `ScanWorker` оттуда же обратно). Вместо этого в `api/app.py` — узкий `Protocol` (`ScanWorkerLike`, всего `last_scan_at` + `request_rescan()`), тот же приём, что `UploadGateway`/`RegistrationClient` в `pipeline.py` (этап 8, решение 3). `StateRepository` — без Protocol: он и так единственная реализация, никогда не подменяется (решение подтверждено ещё на этапе 8, пункт 3 — «`StateRepository` за Protocol не прячем»).
+7. **DRY_RUN-заглушки (`DryRunS3Gateway`, `DryRunLmsClient`) — тоже в `main.py`**, реализуют те же Protocol (`UploadGateway`/`RegistrationClient` из `pipeline.py`), структурно, без наследования. Только логируют `INFO` и возвращают успех/`True`. Архивация в dry-run уже устроена иначе (этап 8, решение 12: единственная ветка `if self._dry_run` внутри самого `Pipeline`, не через инъекцию объекта) — для неё отдельная заглушка не нужна.
+8. **Порядок сборки в `main()` важен**: `configure_logging(settings)` вызывается **до** создания `StateRepository`. `configure_logging` создаёт `settings.data_dir / "logs"` через `mkdir(parents=True, exist_ok=True)` — побочным эффектом это создаёт и сам `settings.data_dir`, если его ещё нет. Если поменять порядок, `StateRepository` может упасть на несуществующей директории для `state.db`.
+9. **`Settings()`/`load_groups(...)` не оборачиваются в `try/except` в `main()`.** Обе ошибки — pydantic `ValidationError` — уже сами по себе достаточно информативны («падение на старте с внятным сообщением», CLAUDE.md), самим этим требованием оправдан fail-fast без дополнительной обработки.
+10. **`.close()` для `S3Gateway`/`LmsClient` (или их dry-run заглушек) — в `finally` после остановки воркера.** Оба класса (и заглушки, для единообразия — у них тоже пустой `close()`) владеют `httpx.Client`; закрывать нужно после того, как воркер точно не будет делать новых запросов (иначе теоретическая гонка — воркер начинает новый цикл, а клиент уже закрыт).
+
+### 10.1 `ScanWorker` и DRY_RUN-заглушки (main.py)
+
+```python
+class ScanWorker:
+    """Периодический запуск Pipeline.run_cycle() в фоновом потоке + внеочередной триггер."""
+
+    def __init__(self, pipeline: Pipeline, scan_interval_seconds: int) -> None:
+        self._pipeline = pipeline
+        self._scan_interval_seconds = scan_interval_seconds
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self.last_scan_at: datetime | None = None
+
+    def run(self) -> None:
+        """Тело потока: цикл до stop(), прерываемый заранее через request_rescan()."""
+
+    def request_rescan(self) -> None:
+        """Будит поток немедленно, не дожидаясь SCAN_INTERVAL_SECONDS."""
+
+    def stop(self) -> None:
+        """Просит поток завершиться на следующей проверке; тоже будит его."""
+
+
+class DryRunS3Gateway:
+    """DRY_RUN=true: не трогает сеть, логирует и притворяется успехом."""
+
+
+class DryRunLmsClient:
+    """DRY_RUN=true: не трогает сеть, логирует и притворяется успехом."""
+```
+
+- [x] `run()`: `while not self._stop_event.is_set(): try: self._pipeline.run_cycle() except Exception: logger.exception(...); self.last_scan_at = datetime.now(UTC); self._wake_event.wait(timeout=self._scan_interval_seconds); self._wake_event.clear()`.
+- [x] `request_rescan()` / `stop()` — оба просто `self._wake_event.set()` (`stop()` дополнительно `self._stop_event.set()`).
+- [x] `DryRunS3Gateway.upload_video/put_manifest` — `logger.info(...)`, ничего не возвращают; `verify` — `logger.info(...)`, `return True`.
+- [x] `DryRunLmsClient.register` — `logger.info(...)`, ничего не возвращает.
+- [x] Оба dry-run класса — `close(self) -> None: pass`.
+
+### 10.2 `main()` — сборка зависимостей
+
+Порядок (решения 8–9):
+
+1. `settings = Settings()`.
+2. `configure_logging(settings)`.
+3. `groups_config = load_groups(settings.groups_file)`.
+4. `repo = StateRepository(settings.data_dir / "state.db")`.
+5. `events = EventBus()` (подписчиков сейчас нет — `TelegramNotifier` отложен, этап 9; шина всё равно нужна `Pipeline`).
+6. `scanner`, `stability`, `date_extractors`, `resolver`, `key_builder` — как в тестовых хелперах `tests/test_pipeline.py` (`make_pipeline`), только с реальными значениями из `settings`.
+7. `s3 = DryRunS3Gateway() if settings.dry_run else S3Gateway(...)`; аналогично `lms`.
+8. `pipeline = Pipeline(scanner=..., stability=..., repo=repo, date_extractors=[...], resolver=resolver, key_builder=key_builder, s3=s3, lms=lms, events=events, bucket=settings.s3_bucket, archive_subdir=settings.archive_subdir, archive_after_register=settings.archive_after_register, max_attempts=settings.max_attempts, skip_older_than_days=settings.skip_older_than_days, dry_run=settings.dry_run)`.
+9. `worker = ScanWorker(pipeline, settings.scan_interval_seconds)`; `worker_thread = threading.Thread(target=worker.run, name="scan-worker")`; `worker_thread.start()`.
+10. `app = create_app(repo=repo, worker=worker)`.
+11. `try: uvicorn.run(app, host="0.0.0.0", port=settings.api_port) finally: worker.stop(); worker_thread.join(); s3.close(); lms.close()`.
+
+- [x] `def main() -> None:` без параметров.
+- [x] Секреты разворачиваются здесь и только здесь: `settings.s3_secret_key.get_secret_value()`, `settings.lms_hmac_secret.get_secret_value()`.
+- [x] **Найдено mypy (не было в постановке):** `Settings()` без аргументов требовал плагин `pydantic.mypy` — добавлен в `[tool.mypy] plugins` (`pyproject.toml`); без него mypy не понимает, что поля читаются из env, и требует их как обязательные параметры конструктора.
+- [x] **Найдено mypy:** `date_extractors` без явной аннотации схлопывался в `list[object]` — добавлена `list[DateExtractor]`.
+- [x] **Реальный пробел в `S3Gateway` (этап 6):** у класса не было `close()` вообще, хотя `boto3`-клиент его поддерживает (закрывает пул соединений). Добавлен `S3Gateway.close()` — небольшая, но настоящая правка уже закрытого этапа.
+- [x] **Устаревший тест:** `tests/test_scaffold.py::test_entry_point_stub` проверял, что `main()` бросает `NotImplementedError` (заглушка этапа 1). Заменён на `test_main_fails_fast_without_required_settings` — доказывает fail-fast (`ValidationError` от pydantic) без обязательных переменных окружения, не трогая сеть/потоки.
+
+### 10.3 `api/app.py`
+
+```python
+class ScanWorkerLike(Protocol):
+    """Узкий интерфейс воркера, который нужен API — не импортирует ScanWorker из main.py."""
+
+    last_scan_at: datetime | None
+
+    def request_rescan(self) -> None: ...
+
+
+def create_app(*, repo: StateRepository, worker: ScanWorkerLike) -> FastAPI:
+    """Три эндпоинта; вся логика — прямые вызовы repo/worker, без бизнес-правил."""
+```
+
+- [x] `GET /health` → `{"status": "ok", "last_scan_at": worker.last_scan_at.isoformat() if worker.last_scan_at else None}`.
+- [x] `GET /status` → `{"counts": repo.count_by_status(), "recent": repo.get_recent(20)}` — `FileState` сериализуется FastAPI сам через `jsonable_encoder`.
+- [x] `POST /rescan` → `worker.request_rescan()`; `return {"status": "triggered"}`.
+- [x] Все три — обычные `def`, не `async def`.
+- [x] Аутентификации нет.
+
+### 10.4 Тесты
+
+`tests/test_main.py` (11 тестов):
+- [x] `run()` в фоновом потоке + `stop()` → поток завершается (`join(timeout=...)`, `is_alive() is False`).
+- [x] `request_rescan()` прерывает `wait()` немедленно (< 1 с при `scan_interval_seconds=60`).
+- [x] `last_scan_at` обновляется после каждого цикла.
+- [x] Исключение из `pipeline.run_cycle()` не убивает поток — следующий цикл происходит.
+- [x] `DryRunS3Gateway`/`DryRunLmsClient`: методы не бросают, `verify()` возвращает `True`, `close()` не бросает.
+
+`tests/api/test_app.py` (6 тестов, `fastapi.testclient.TestClient`, `StateRepository` настоящий на `tmp_path`, воркер — лёгкий тестовый дубль):
+- [x] `GET /health` без предшествующих циклов → `last_scan_at: null`; после — `.isoformat()`.
+- [x] `GET /status` → `counts`/`recent` соответствуют состоянию `StateRepository`; `recent` ограничен 20 записями.
+- [x] `POST /rescan` → `200 {"status": "triggered"}`, `request_rescan()` вызван ровно один раз.
+
+### Definition of Done (этап 10)
+
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 221/221 тестов.
+- [x] **Ручная проверка выполнена по-настоящему** (не просто curl `/health`): `uv run video-uploader` с `DRY_RUN=true` в фоне — поднялся, `/health`/`/status`/`/rescan` ответили. Добавлен реальный видеофайл (стабильный по mtime) в тестовую папку группы → `POST /rescan` → `GET /status` показал полный проход `discovered → uploaded → registered` (dry-run, без архивации, файл остался на месте — ровно как задумано решением этапа 8). Проверены логи (`RotatingFileHandler`, кириллица в путях через `encoding="utf-8"` — без искажений). `kill -TERM` → uvicorn корректно поймал сигнал, лог показал `Shutting down → Application shutdown complete → Finished server process`, порт освобождён, процесс полностью завершился (значит `worker_thread.join()` в `finally` тоже отработал, не завис).
+- [x] Ревью Claude пройдено (код и тесты написаны Claude по вашей просьбе).
+- [ ] Коммит — на вашей стороне.
+
+---
+
+## Этап 11 — Поставка (Docker, README, smoke-скрипт, документация) ← ТЕКУЩИЙ
+
+**Цель:** последний этап — код пайплайна больше не меняется (этапы 2–10 закрыты). Здесь только упаковка: `Dockerfile`, `docker-compose.yml`, ручной `scripts/smoke_s3.py`, и документация (`README.md`, `.docs/basic_doc.md`, `.docs/API_doc.md`). Решать почти нечего — форма Docker-сборки и compose уже полностью специфицирована в CLAUDE.md (раздел Runtime Environment), это транскрипция, не проектирование.
+
+**Затрагиваемые файлы:** `Dockerfile`, `docker-compose.yml`, `.dockerignore` (не было — нужен для чистого build context), `scripts/smoke_s3.py`, `README.md`, `.docs/basic_doc.md`, `.docs/API_doc.md`.
+
+### Решения
+
+1. **Multi-stage `Dockerfile`**: builder-этап (`uv sync --frozen --no-dev`, сначала только `pyproject.toml`+`uv.lock` для кэша слоя зависимостей, потом код) → финальный этап копирует `.venv` + `video_uploader/` от непривилегированного пользователя `uid 1000`. Оба этапа — на `ghcr.io/astral-sh/uv:python3.12-bookworm-slim`, как явно указано в CLAUDE.md.
+2. **`HEALTHCHECK` — в `docker-compose.yml`, не в `Dockerfile`.** CLAUDE.md перечисляет его именно в bullet про docker-compose («TZ=...; restart: unless-stopped; HEALTHCHECK → GET /health»), Dockerfile-bullet про него не упоминает. Через `python -c "...urllib.request..."`, не `curl` — на `bookworm-slim` curl не гарантирован, python есть точно (это python-образ).
+3. **`ports:` в compose — добавляю, хотя CLAUDE.md явно не перечисляет** (только тома/TZ/restart/healthcheck): без публикации порта `API_PORT` наружу LXC HTTP API недостижим даже из «Tech/Admin-сегмента», а CLAUDE.md прямо говорит, что доступ оттуда должен быть. Если не согласны — уберу, `HEALTHCHECK` при этом всё равно работает (он бьёт внутри контейнерной сети, порт наружу не нужен).
+4. **`env_file: .env` в compose**, а не построчный `environment:` на 20+ переменных — тот самый `.env`, что рядом с `docker-compose.yml` (создаётся из `.env.example`), автоматически и для подстановки `${TZ_NAME}` в самом YAML, и для инъекции всех переменных в контейнер.
+5. **`scripts/smoke_s3.py` — не часть пакета, не под pytest**, обычный скрипт вне `mypy --strict`/CI-гейта (CLAUDE.md: «вне pytest»). Читает `Settings()`, поднимает `S3Gateway` как в `main.py`, грузит маленький тестовый объект под префиксом `smoke-test/`, проверяет `verify()`, кладёт манифест, затем удаляет тестовый объект напрямую через `boto3` (у `S3Gateway` нет и не должно быть `delete` — сервис в рантайме никогда не удаляет; это ограничение про исходники на шаре, не про тестовые объекты в S3, поэтому в ad hoc-скрипте прямой `delete_object` уместен).
+6. **`.dockerignore`** — исключает то же, что и `.gitignore` (venv/кеши/IDE), плюс `.git/`, `tests/`, `.docs/` — тестам и документации незачем попадать в build context прод-образа.
+
+### 11.1 `Dockerfile`
+
+- [x] Builder-стадия: `WORKDIR /app`; сначала `COPY pyproject.toml uv.lock ./`, `uv sync --frozen --no-dev --no-install-project` (кэш зависимостей отдельным слоем); затем `COPY video_uploader ./video_uploader` + `README.md`, `uv sync --frozen --no-dev`.
+- [x] Финальная стадия: тот же базовый образ; `groupadd`+`useradd --uid 1000 --create-home --shell /usr/sbin/nologin appuser`; `COPY --from=builder --chown=appuser:appuser /app /app`; `USER appuser`; `ENV PATH="/app/.venv/bin:$PATH"`; `CMD ["video-uploader"]`.
+
+### 11.2 `docker-compose.yml`
+
+- [x] `services.video-uploader`: `build: .`; `restart: unless-stopped`; `env_file: .env`; `environment: TZ: ${TZ_NAME:-Europe/Kaliningrad}`; `volumes: /mnt/video:/mnt/video, ./data:/data, ./config:/app/config:ro`; `ports: "${API_PORT:-8090}:8090"`; `healthcheck` через `python -c "...urlopen('http://localhost:'+os.environ.get('API_PORT','8090')+'/health')..."`.
+- [x] Синтаксис проверен `docker compose config` — валиден, все подстановки резолвятся.
+
+### 11.3 `.dockerignore`
+
+- [x] `.git/`, `.github/`, `.claude/`, `.docs/`, `.idea/`, `tests/`, `__pycache__/`, `*.py[cod]`, `.venv/`, `dist/`, `build/`, `*.egg-info/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `.env`, `data/`, `.DS_Store`.
+
+### 11.4 `scripts/smoke_s3.py`
+
+- [x] `Settings()` → `S3Gateway(...)` (реальные креды из `.env`, не dry-run); ключ `f"smoke-test/{uuid4().hex}.txt"`; `upload_video`/`put_manifest`/`verify` с маленьким временным файлом (`tempfile`); печать результата на каждом шаге; `delete_object` в конце напрямую через `boto3.client("s3", ...)` с теми же параметрами подключения (и для видео-ключа, и для манифест-ключа).
+- [x] `if __name__ == "__main__":` — не в `[project.scripts]`, запускается `uv run python scripts/smoke_s3.py`.
+- [x] `ruff`/`mypy` чистые и на этом файле (хотя формально вне обязательного гейта `mypy video_uploader`).
+
+### 11.5 Документация
+
+- [x] `.docs/basic_doc.md` — структура проекта, технологии (где/почему), паттерны (где/почему), сводка по доработке (каналы логирования, новые папки сканирования, другое хранилище), как пользоваться (настройки, деплой, S3-ключи, интеграция LMS). **Заполнено напрямую** (документация, не код — не требует цикла постановка → пишете сами).
+- [x] `.docs/API_doc.md` — все три HTTP-эндпоинта сервиса с примерами запрос/ответ. **Заполнено напрямую**, на основе реального ручного прогона с этапа 10.
+
+### Definition of Done (этап 11)
+
+- [ ] **`docker compose build`/`up` — НЕ проверено.** В этой рабочей среде демон Docker не запущен (`Cannot connect to the Docker daemon`) — реальную сборку и `GET /health` из контейнера проверить не удалось технически. Проверена только валидность `docker-compose.yml` (`docker compose config` — чисто, все подстановки резолвятся). **Нужна ваша проверка** реальной сборки на машине с работающим Docker, прежде чем считать этап полностью закрытым.
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 221/221 тестов (новые файлы вне `video_uploader/` гейт не задели).
+- [x] JSON-примеры в `.docs/API_doc.md`/`.docs/basic_doc.md` проверены программно на валидность (`json.loads` по всем блокам) — нашёл и поправил одну свою опечатку (`245_681_302` — синтаксис Python, не JSON).
+- [x] Ревью Claude пройдено (код и документация написаны Claude по вашей просьбе).
 - [ ] Коммит — на вашей стороне.

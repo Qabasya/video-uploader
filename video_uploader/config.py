@@ -54,6 +54,8 @@ class Settings(BaseSettings):
 
     # Секреты
     s3_secret_key: SecretStr
+    lms_hmac_secret: SecretStr
+    telegram_bot_token: SecretStr | None = None
 
     # Опциональные строки
     loki_url: str | None = None
