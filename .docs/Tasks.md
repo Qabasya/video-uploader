@@ -828,7 +828,7 @@ def _sign(self, timestamp: int, raw_body: bytes) -> str:
 - [x] Решение 1 (Loki — основной канал, Telegram отменён в этом репозитории) подтверждено вами.
 - [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 210/210 тестов.
 - [x] Ревью Claude пройдено (код и тесты написаны Claude по вашей просьбе).
-- [ ] Коммит — на вашей стороне.
+- [x] Коммит — на вашей стороне.
 
 ### Не код (важно для будущего aiogram-сервиса, не задача этого репозитория)
 
