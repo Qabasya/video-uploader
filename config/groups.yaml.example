@@ -17,9 +17,9 @@
 # не различает — семантику задаёт состав lms-блока на стороне плагина:
 #   - есть group_id  → групповая ветка (видео крепится к занятию группы
 #                       по дате/времени recorded_at);
-#   - только teacher_username, без group_id → индивидуальная ветка
+#   - только teacher_id, без group_id → индивидуальная ветка
 #                       (занятие kind='individual' этого преподавателя).
-# teacher_username = WP user_login = sAMAccountName в домене.
+# teacher_id — числовой WP user ID преподавателя (тот же ID, что в fs_lms_groups.teacher_id).
 groups:
   "КЕГЭ-1":                    # папка группы — групповые занятия
     slug: kege-1
@@ -36,4 +36,4 @@ groups:
   "Индивидуальные-Петров":     # персональная папка препода — индивидуальные занятия
     slug: ind-petrov
     lms:
-      teacher_username: "i.petrov"
+      teacher_id: 7

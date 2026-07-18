@@ -36,7 +36,7 @@ def test_valid_config_loads(tmp_path: Path) -> None:
 
 
 def test_individual_teacher_folder_loads(tmp_path: Path) -> None:
-    """Персональная папка препода: только teacher_username, без group_id (CLAUDE.md)."""
+    """Персональная папка препода: только teacher_id, без group_id (CLAUDE.md)."""
     path = write_yaml(
         tmp_path,
         """
@@ -44,13 +44,13 @@ def test_individual_teacher_folder_loads(tmp_path: Path) -> None:
           "Индивидуальные-Петров":
             slug: ind-petrov
             lms:
-              teacher_username: "i.petrov"
+              teacher_id: 7
         """,
     )
     config = load_groups(path)
     entry = config.groups["Индивидуальные-Петров"]
     assert entry.slug == "ind-petrov"
-    assert entry.lms == {"teacher_username": "i.petrov"}
+    assert entry.lms == {"teacher_id": 7}
 
 
 def test_multiple_groups_load(tmp_path: Path) -> None:
