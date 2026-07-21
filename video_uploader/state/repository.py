@@ -130,13 +130,20 @@ class StateRepository:
         event.listen(self._engine, "connect", _enable_wal)
         Base.metadata.create_all(self._engine)
 
-    def discover(self, path: Path, group_name: str, size_bytes: int, mtime: float) -> int:
-        """Заводит запись со статусом ``discovered``; повторный вызов идемпотентен."""
+    def discover(
+        self, path: Path, group_name: str, size_bytes: int, mtime: float
+    ) -> tuple[int, bool]:
+        """Заводит запись со статусом ``discovered``; повторный вызов идемпотентен.
+
+        Возвращает ``(file_id, is_new)`` — ``is_new`` истинен только при первом
+        обнаружении файла (нужно вызывающему коду, чтобы не логировать/публиковать
+        событие обнаружения повторно на каждом цикле сканирования).
+        """
         path_str = str(path)
         with Session(self._engine) as session:
             existing = session.scalar(select(FileRecord).where(FileRecord.path == path_str))
             if existing is not None:
-                return existing.id
+                return existing.id, False
             now = _now()
             record = FileRecord(
                 path=path_str,
@@ -149,7 +156,7 @@ class StateRepository:
             )
             session.add(record)
             session.commit()
-            return record.id
+            return record.id, True
 
     def get_cached_sha256(self, path: Path, size_bytes: int, mtime: float) -> str | None:
         """``sha256`` из реестра для точного ``(path, size, mtime)`` либо ``None``."""

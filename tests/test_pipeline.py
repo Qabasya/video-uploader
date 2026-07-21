@@ -13,6 +13,7 @@ from video_uploader.domain.events import (
     EventBus,
     GroupUnmapped,
     VideoArchived,
+    VideoDiscovered,
     VideoFailed,
     VideoRegistered,
     VideoUploaded,
@@ -143,7 +144,7 @@ class TestHappyPath:
         lms = FakeLmsClient()
         events = EventBus()
         published: list[object] = []
-        for event_type in (VideoUploaded, VideoRegistered, VideoArchived):
+        for event_type in (VideoDiscovered, VideoUploaded, VideoRegistered, VideoArchived):
             events.subscribe(event_type, published.append)
 
         video_path = video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm"
@@ -155,7 +156,9 @@ class TestHappyPath:
 
         # успешные шаги должны попадать в логи (канал Loki) — не только в EventBus
         info_messages = [r.message for r in caplog.records if r.levelname == "INFO"]
+        assert any("обнаружено" in m for m in info_messages)
         assert any("загружено" in m for m in info_messages)
+        assert any("верифицировано" in m for m in info_messages)
         assert any("зарегистрировано" in m for m in info_messages)
         assert any("архив" in m for m in info_messages)
 
@@ -169,6 +172,7 @@ class TestHappyPath:
         assert len(s3.manifest_calls) == 1
         assert len(lms.register_calls) == 1
         assert [type(event) for event in published] == [
+            VideoDiscovered,
             VideoUploaded,
             VideoRegistered,
             VideoArchived,
@@ -186,21 +190,30 @@ class TestHappyPath:
 
 
 class TestStability:
-    def test_unstable_file_is_left_alone(self, video_root: Path, repo: StateRepository) -> None:
+    def test_unstable_file_is_left_alone(
+        self, video_root: Path, repo: StateRepository, caplog: pytest.LogCaptureFixture
+    ) -> None:
         s3 = FakeS3Gateway()
         lms = FakeLmsClient()
         events = EventBus()
+        discovered: list[VideoDiscovered] = []
+        events.subscribe(VideoDiscovered, discovered.append)
         video_path = video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm"
         video_path.parent.mkdir(parents=True)
         video_path.write_bytes(b"data")  # свежий mtime, не состарен
 
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events)
-        pipeline.run_cycle()
+        with caplog.at_level(logging.DEBUG, logger="video_uploader.pipeline"):
+            pipeline.run_cycle()
+            pipeline.run_cycle()  # второй цикл: файл всё ещё нестабилен
 
         state = repo.get_by_id(only_record_id(repo))
         assert state is not None
         assert state.status == "discovered"
         assert s3.upload_calls == []
+        # обнаружение публикуется/логируется один раз, не на каждом цикле
+        assert len(discovered) == 1
+        assert any(r.levelname == "DEBUG" and "дописывается" in r.message for r in caplog.records)
 
 
 class TestGroupUnmapped:
@@ -253,7 +266,9 @@ class TestGroupUnmapped:
 
 
 class TestSkipOlderThanDays:
-    def test_old_lesson_is_skipped(self, video_root: Path, repo: StateRepository) -> None:
+    def test_old_lesson_is_skipped(
+        self, video_root: Path, repo: StateRepository, caplog: pytest.LogCaptureFixture
+    ) -> None:
         s3 = FakeS3Gateway()
         lms = FakeLmsClient()
         events = EventBus()
@@ -263,12 +278,14 @@ class TestSkipOlderThanDays:
         pipeline = make_pipeline(
             video_root, repo, s3=s3, lms=lms, events=events, skip_older_than_days=7
         )
-        pipeline.run_cycle()
+        with caplog.at_level(logging.INFO, logger="video_uploader.pipeline"):
+            pipeline.run_cycle()
 
         state = repo.get_by_id(only_record_id(repo))
         assert state is not None
         assert state.status == "skipped_old"
         assert s3.upload_calls == []
+        assert any("пропущено" in r.message for r in caplog.records)
 
 
 class TestDateFallback:
@@ -417,7 +434,7 @@ class TestResumeFromUploading:
         video_path = video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm"
         write_stable_file(video_path)
 
-        file_id = repo.discover(
+        file_id, _ = repo.discover(
             video_path, "КЕГЭ-1", video_path.stat().st_size, video_path.stat().st_mtime
         )
         repo.mark_uploading(file_id)  # симуляция крэша между mark_uploading и mark_uploaded

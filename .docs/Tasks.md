@@ -1016,3 +1016,73 @@ def create_app(*, repo: StateRepository, worker: ScanWorkerLike) -> FastAPI:
 Единственный конфликт по пути (в `.docs/CLAUDE.md` — git не распознал переименование корневого `CLAUDE.md`, конфликтовал только отсутствующий перевод строки в конце файла, содержимое было побайтово идентично) разрешён локально дважды (пробный мердж, затем реальный на `stage-10` перед пушем) — оба раза одинаково, оба раза с зелёным gate после.
 
 Все 11 этапов исходного плана закрыты, включая финальную проверку Docker-сборки (см. п. 11.4 выше — реальный `docker compose up --build` и дымовой прогон пайплайна в DRY_RUN прошли успешно). Поставка полностью завершена; README.md написан и покрывает установку, настройку, DRY_RUN и деплой.
+
+---
+
+## Доп. задача — `DRY_RUN_LMS_LIVE` (реальная регистрация в LMS при сухом прогоне) ← ТЕКУЩИЙ
+
+**Дата:** 2026-07-21. **Контекст:** проект полностью поставлен (см. «Итог» выше); эндпоинт `fs-lms` (`POST /wp-json/fs-lms/v1/videos`) теперь существует, и `DRY_RUN=true` больше не обязан подменять LMS-регистрацию заглушкой — нужна возможность гонять `DRY_RUN=true` с реальным вызовом плагина (проверить матчинг занятия по дате/времени на тестовом курсе), не трогая при этом реальный S3 и не архивируя исходники.
+
+**Цель:** новый независимый флаг `DRY_RUN_LMS_LIVE` (default `false`). При `DRY_RUN=true` и `DRY_RUN_LMS_LIVE=true` — LMS-регистрация идёт настоящим `LmsClient` (реальный HTTP + HMAC), S3-загрузка и архивация остаются заглушками, как и раньше. При `DRY_RUN=false` флаг не имеет смысла (LMS и так настоящий) — сервис не обязан на него смотреть, но и падать из-за него не должен.
+
+**Затрагиваемые файлы:** `video_uploader/config.py`, `video_uploader/main.py`, `.env.example`, `.docs/CLAUDE.md` (раздел Configuration + LMS REST), `tests/test_config.py`, `tests/test_main.py`.
+
+### Решения, принятые в постановке (если не согласны — обсуждаем до кода)
+
+1. **Название и семантика** — `DRY_RUN_LMS_LIVE: bool = False` в `Settings`, рядом с `dry_run` (секция «Флаги»). Существующий `DRY_RUN` не трогаем и не переименовываем — обратная совместимость полная, дефолтное поведение не меняется.
+2. **Ветвление — в `main()`, не в `Pipeline`.** Как и раньше, `Pipeline` ничего не знает про `DRY_RUN`/`DRY_RUN_LMS_LIVE` — только про Protocol `RegistrationClient`. Выбор конкретной реализации — целиком забота composition root.
+3. **Вынести выбор gateway/client в отдельные функции** `_build_s3_gateway(settings) -> UploadGateway` и `_build_lms_client(settings) -> RegistrationClient` (module-level функции в `main.py`, рядом с `DryRunS3Gateway`/`DryRunLmsClient`) — сейчас это заинлайнено в `main()`, а `main()` целиком не тестируется (блокируется на `uvicorn.run`). Вынесенные функции — тестируемая единица без потоков/сети.
+4. **Логика `_build_lms_client`:**
+   ```python
+   def _build_lms_client(settings: Settings) -> DryRunLmsClient | LmsClient:
+       if settings.dry_run and not settings.dry_run_lms_live:
+           return DryRunLmsClient()
+       return LmsClient(settings.lms_base_url, settings.lms_hmac_secret.get_secret_value())
+   ```
+   `_build_s3_gateway` — та же форма, но `dry_run_lms_live` не участвует в условии (S3 всегда заглушка при `dry_run=True`, новый флаг S3 не касается).
+5. **Архивация не меняется** — `_cleanup` в `pipeline.py` по-прежнему смотрит только на `self._dry_run` (не на новый флаг): раз S3-загрузка фейковая, реального файла в бакете нет, и переносить исходник в архив нельзя, даже если LMS-регистрация была настоящей. `pipeline.py` эта задача не трогает вообще.
+6. **`DRY_RUN_LMS_LIVE=true` без `DRY_RUN=true`** — не ошибка валидации, просто не имеет эффекта (LMS и так настоящий). Отдельного doc/предупреждения не нужно, но стоит закрыть тестом (п. ниже), чтобы поведение не расползлось при будущем рефакторинге.
+
+### Задачи
+
+- [x] `config.py`: новое поле `dry_run_lms_live: bool = Field(default=False)` — в секции «Флаги», сразу после `dry_run`.
+- [x] `main.py`: функции `_build_s3_gateway(settings: Settings) -> DryRunS3Gateway | S3Gateway` и `_build_lms_client(settings: Settings) -> DryRunLmsClient | LmsClient` по решениям 3–4; `main()` использует обе функции вместо инлайн `if settings.dry_run: ... else: ...` (текущий блок `main.py:112-125`).
+- [x] `.env.example`: новая строка `DRY_RUN_LMS_LIVE=false` сразу под `DRY_RUN=false`, с комментарием («при `DRY_RUN=true` — регистрировать видео в LMS по-настоящему, S3 и архивация остаются заглушками; для проверки матчинга занятия без реальной загрузки видео»).
+- [x] `.docs/CLAUDE.md`, таблица Configuration: новая строка `DRY_RUN_LMS_LIVE` рядом с `DRY_RUN`.
+- [x] `.docs/CLAUDE.md`, раздел «LMS REST (push)», последний абзац («До его появления используется `DRY_RUN=true`...») — обновлён: эндпоинт уже есть, `DRY_RUN_LMS_LIVE=true` включает реальную регистрацию при сухом прогоне.
+- [x] `tests/test_config.py`: `dry_run_lms_live` по умолчанию `False`; переопределяется через env `DRY_RUN_LMS_LIVE=true` → `True`.
+- [x] `tests/test_main.py`, новый класс `TestBuildGateways`:
+  - `dry_run=False` → `_build_lms_client` возвращает `LmsClient` независимо от `dry_run_lms_live`; `_build_s3_gateway` возвращает `S3Gateway`.
+  - `dry_run=True, dry_run_lms_live=False` (default) → `DryRunLmsClient` (текущее поведение не сломалось).
+  - `dry_run=True, dry_run_lms_live=True` → `_build_lms_client` возвращает `LmsClient`; `_build_s3_gateway` всё равно возвращает `DryRunS3Gateway` (S3 флаг не касается).
+  - Реальной сети/HTTP-вызовов в тестах нет — `LmsClient.__init__` только собирает `httpx.Client`, соединение не открывает.
+
+### Definition of Done
+
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 224/224 тестов.
+- [ ] Ручная проверка обоих режимов сухого прогона (реальный fs-lms/тестовый курс) — см. `.docs/basic_doc.md`, раздел 5.7 «Проверка обоих режимов сухого прогона». Не выполнялась в рамках этой сессии — нужен доступ к тестовому/staging fs-lms.
+- [x] Ревью Claude — код и тесты написаны Claude по вашей прямой просьбе («реализуй задачи самостоятельно»).
+- [ ] Коммит — на вашей стороне.
+
+---
+
+## Доп. правка — покрытие каждого шага пайплайна логами (по вашей просьбе)
+
+**Дата:** 2026-07-21. Аудит по запросу «убедись, что каждый шаг логируется» нашёл реальный пробел: событие `VideoDiscovered` было заведено в домене ещё на этапе 2 (`domain/events.py`) и покрыто тестами `test_events.py`, но `pipeline.py` (этап 8) его никогда не публиковал и не логировал обнаружение файла — единственный шаг из докстринга `Pipeline` (`scan → stability → dedup → metadata → resolve → upload → verify → register → cleanup`) без своего лога/события. Заодно не было явного лога на успешный `verify` и на `skipped_old`.
+
+**Изменения:**
+
+- `state/repository.py`: `StateRepository.discover()` теперь возвращает `tuple[int, bool]` (`file_id`, `is_new`) — иначе pipeline не мог бы отличить «файл только что впервые увиден» от «уже видели на прошлых циклах» и логировал/публиковал бы `VideoDiscovered` на каждом цикле сканирования (спам, файл может неделю висеть в `discovered`, если не проходит стабильность). Обновлены все вызовы `discover()` (`pipeline.py`, тесты).
+- `pipeline.py`:
+  - `run_cycle`: при `is_new=True` — `logger.info("видео обнаружено: %s", ...)` + `events.publish(VideoDiscovered(...))`.
+  - Ожидание стабильности: `logger.debug("файл ещё дописывается, ждём стабильности: %s", ...)` — DEBUG, не INFO, чтобы не шуметь в проде на каждом цикле по каждому ещё не устоявшемуся файлу.
+  - `skipped_old`: `logger.info("видео пропущено (старше %s дней): %s", ...)` — раньше переход в БД был, а лога не было.
+  - Успешный `verify`: `logger.info("видео верифицировано в S3: %s", s3_key)`.
+- Теперь у всех 7 доменных событий (`VideoDiscovered`, `VideoUploaded`, `VideoRegistered`, `VideoArchived`, `VideoFailed`, `GroupUnmapped`, `DateFallback`) есть ровно одна точка публикации в `pipeline.py`, и каждый значимый шаг (обнаружение, стабильность, дедуп, дата, skip_old, resolve, upload, verify, register, cleanup, ошибка) пишет что-то в лог — INFO на успех, WARNING на аномалии (`DateFallback`, `GroupUnmapped`), DEBUG на ожидание, `logger.exception` на сбой.
+- Тесты: `tests/state/test_repository.py` (новый `is_new` тест), `tests/test_pipeline.py` (`TestHappyPath` проверяет полный набор INFO-сообщений и порядок из 4 событий начиная с `VideoDiscovered`; `TestStability` проверяет, что `VideoDiscovered` публикуется один раз даже за два цикла подряд, и что есть DEBUG-лог; `TestSkipOlderThanDays` проверяет новый INFO-лог), `tests/api/test_app.py` (обновлён вызов `discover()` под новую сигнатуру).
+
+**Definition of Done:**
+
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 225/225 тестов.
+- [x] Ревью Claude — код и тесты написаны Claude по вашей прямой просьбе.
+- [ ] Коммит — на вашей стороне.

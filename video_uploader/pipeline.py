@@ -19,6 +19,7 @@ from video_uploader.domain.events import (
     EventBus,
     GroupUnmapped,
     VideoArchived,
+    VideoDiscovered,
     VideoFailed,
     VideoRegistered,
     VideoUploaded,
@@ -159,7 +160,7 @@ class Pipeline:
         warned_folders: set[str] = set()
         for video_file in self._scanner.scan():
             try:
-                file_id = self._repo.discover(
+                file_id, is_new = self._repo.discover(
                     video_file.path,
                     video_file.group_folder,
                     video_file.size_bytes,
@@ -168,6 +169,10 @@ class Pipeline:
             except Exception:
                 logger.exception("не удалось завести запись реестра для %s", video_file.path)
                 continue
+
+            if is_new:
+                logger.info("видео обнаружено: %s", video_file.path)
+                self._events.publish(VideoDiscovered(path=video_file.path))
 
             try:
                 self._process(file_id, video_file, warned_folders)
@@ -190,6 +195,7 @@ class Pipeline:
             return
 
         if not self._stability.is_stable(video_file.path):
+            logger.debug("файл ещё дописывается, ждём стабильности: %s", video_file.path)
             return
 
         sha256 = self._resolve_sha256(file_id, video_file)
@@ -212,6 +218,11 @@ class Pipeline:
         if self._skip_older_than_days is not None:
             age_days = (datetime.now(recorded_at.tzinfo) - recorded_at).days
             if age_days > self._skip_older_than_days:
+                logger.info(
+                    "видео пропущено (старше %s дней): %s",
+                    self._skip_older_than_days,
+                    video_file.path,
+                )
                 self._repo.mark_skipped(file_id, "skipped_old")
                 return
 
@@ -261,6 +272,7 @@ class Pipeline:
 
         if not self._s3.verify(s3_key, video_file.size_bytes):
             raise RuntimeError(f"верификация S3 не прошла: {s3_key}")
+        logger.info("видео верифицировано в S3: %s", s3_key)
 
         if state.status != "registered":
             manifest_key = self._key_builder.build_manifest_key(s3_key)

@@ -33,6 +33,7 @@ class TestDefaults:
         assert settings.skip_older_than_days is None
         assert settings.archive_after_register is True
         assert settings.dry_run is False
+        assert settings.dry_run_lms_live is False
         assert settings.archive_subdir == "_uploaded"
         assert settings.tz_name == "Europe/Kaliningrad"
         assert settings.allowed_extensions == (".webm", ".mp4", ".mkv")
@@ -56,10 +57,12 @@ class TestEnvSource:
         monkeypatch.setenv("SCAN_INTERVAL_SECONDS", "60")
         monkeypatch.setenv("VIDEO_ROOT", "/srv/video")
         monkeypatch.setenv("DRY_RUN", "true")
+        monkeypatch.setenv("DRY_RUN_LMS_LIVE", "true")
         settings = make_settings()
         assert settings.scan_interval_seconds == 60
         assert settings.video_root == Path("/srv/video")
         assert settings.dry_run is True
+        assert settings.dry_run_lms_live is True
 
     def test_required_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for name, value in {

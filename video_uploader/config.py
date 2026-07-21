@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     # Флаги
     archive_after_register: bool = Field(default=True)
     dry_run: bool = Field(default=False)
+    dry_run_lms_live: bool = Field(default=False)
 
     # Строки с default
     archive_subdir: str = Field(default="_uploaded")

@@ -14,7 +14,8 @@ def repo(tmp_path: Path) -> StateRepository:
 
 
 def discover_one(repo: StateRepository, path: Path = Path("/mnt/video/КЕГЭ-1/rec.webm")) -> int:
-    return repo.discover(path, group_name="КЕГЭ-1", size_bytes=1000, mtime=1_720_000_000.0)
+    file_id, _ = repo.discover(path, group_name="КЕГЭ-1", size_bytes=1000, mtime=1_720_000_000.0)
+    return file_id
 
 
 class TestDiscover:
@@ -33,6 +34,13 @@ class TestDiscover:
         second_id = discover_one(repo, path)
         assert first_id == second_id
         assert len(repo.get_recent(limit=10)) == 1
+
+    def test_is_new_true_only_on_first_discovery(self, repo: StateRepository) -> None:
+        path = Path("/mnt/video/КЕГЭ-1/rec.webm")
+        _, first_is_new = repo.discover(path, group_name="КЕГЭ-1", size_bytes=1000, mtime=1.0)
+        _, second_is_new = repo.discover(path, group_name="КЕГЭ-1", size_bytes=1000, mtime=1.0)
+        assert first_is_new is True
+        assert second_is_new is False
 
 
 class TestCachedSha256:
@@ -166,7 +174,7 @@ class TestPersistence:
     def test_reopening_repository_sees_previous_data(self, tmp_path: Path) -> None:
         db_path = tmp_path / "state.db"
         first = StateRepository(db_path)
-        file_id = first.discover(
+        file_id, _ = first.discover(
             Path("/mnt/video/КЕГЭ-1/rec.webm"), group_name="КЕГЭ-1", size_bytes=1000, mtime=1.0
         )
 

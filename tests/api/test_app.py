@@ -52,7 +52,7 @@ class TestStatus:
     def test_reflects_repository_state(self, tmp_path: Path) -> None:
         client, repo = make_client(tmp_path, FakeWorker())
 
-        first_id = repo.discover(Path("/mnt/video/КЕГЭ-1/a.webm"), "КЕГЭ-1", 100, 1.0)
+        first_id, _ = repo.discover(Path("/mnt/video/КЕГЭ-1/a.webm"), "КЕГЭ-1", 100, 1.0)
         repo.discover(Path("/mnt/video/КЕГЭ-1/b.webm"), "КЕГЭ-1", 100, 2.0)
         repo.mark_failed(first_id, "boom")
 

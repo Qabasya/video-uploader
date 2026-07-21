@@ -5,7 +5,29 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from video_uploader.main import DryRunLmsClient, DryRunS3Gateway, ScanWorker
+from video_uploader.config import Settings
+from video_uploader.lms.client import LmsClient
+from video_uploader.main import (
+    DryRunLmsClient,
+    DryRunS3Gateway,
+    ScanWorker,
+    _build_lms_client,
+    _build_s3_gateway,
+)
+from video_uploader.storage.s3_gateway import S3Gateway
+
+REQUIRED_SETTINGS: dict[str, object] = {
+    "s3_bucket": "bucket",
+    "s3_access_key": "access-key",
+    "s3_secret_key": "top-secret",
+    "lms_base_url": "http://lms.local",
+    "lms_hmac_secret": "hmac-secret",
+}
+
+
+def make_settings(**overrides: object) -> Settings:
+    """Settings с заполненными обязательными полями; локальный .env не читается."""
+    return Settings(_env_file=None, **{**REQUIRED_SETTINGS, **overrides})
 
 
 class FakePipeline:
@@ -118,3 +140,24 @@ class TestDryRunLmsClient:
         client = DryRunLmsClient()
         client.register({"s3_key": "videos/kege-1/rec.webm"})
         client.close()
+
+
+class TestBuildGateways:
+    def test_live_run_always_real_regardless_of_lms_live_flag(self) -> None:
+        settings = make_settings(dry_run=False, dry_run_lms_live=False)
+        assert isinstance(_build_s3_gateway(settings), S3Gateway)
+        assert isinstance(_build_lms_client(settings), LmsClient)
+
+        settings = make_settings(dry_run=False, dry_run_lms_live=True)
+        assert isinstance(_build_s3_gateway(settings), S3Gateway)
+        assert isinstance(_build_lms_client(settings), LmsClient)
+
+    def test_dry_run_default_fakes_both(self) -> None:
+        settings = make_settings(dry_run=True, dry_run_lms_live=False)
+        assert isinstance(_build_s3_gateway(settings), DryRunS3Gateway)
+        assert isinstance(_build_lms_client(settings), DryRunLmsClient)
+
+    def test_dry_run_lms_live_fakes_only_s3(self) -> None:
+        settings = make_settings(dry_run=True, dry_run_lms_live=True)
+        assert isinstance(_build_s3_gateway(settings), DryRunS3Gateway)
+        assert isinstance(_build_lms_client(settings), LmsClient)

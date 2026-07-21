@@ -89,6 +89,26 @@ class DryRunLmsClient:
         pass
 
 
+def _build_s3_gateway(settings: Settings) -> DryRunS3Gateway | S3Gateway:
+    """``DRY_RUN=true`` → заглушка; иначе ``S3Gateway`` (``DRY_RUN_LMS_LIVE`` тут не влияет)."""
+    if settings.dry_run:
+        return DryRunS3Gateway()
+    return S3Gateway(
+        endpoint_url=settings.s3_endpoint_url,
+        region=settings.s3_region,
+        bucket=settings.s3_bucket,
+        access_key=settings.s3_access_key,
+        secret_key=settings.s3_secret_key.get_secret_value(),
+    )
+
+
+def _build_lms_client(settings: Settings) -> DryRunLmsClient | LmsClient:
+    """Заглушка только при ``DRY_RUN=true`` и ``DRY_RUN_LMS_LIVE=false``; иначе настоящий клиент."""
+    if settings.dry_run and not settings.dry_run_lms_live:
+        return DryRunLmsClient()
+    return LmsClient(settings.lms_base_url, settings.lms_hmac_secret.get_secret_value())
+
+
 def main() -> None:
     """Точка входа CLI ``video-uploader``."""
     settings = Settings()
@@ -109,20 +129,8 @@ def main() -> None:
     resolver = GroupResolver(groups_config)
     key_builder = KeyBuilder(prefix=settings.s3_key_prefix)
 
-    s3: DryRunS3Gateway | S3Gateway
-    lms: DryRunLmsClient | LmsClient
-    if settings.dry_run:
-        s3 = DryRunS3Gateway()
-        lms = DryRunLmsClient()
-    else:
-        s3 = S3Gateway(
-            endpoint_url=settings.s3_endpoint_url,
-            region=settings.s3_region,
-            bucket=settings.s3_bucket,
-            access_key=settings.s3_access_key,
-            secret_key=settings.s3_secret_key.get_secret_value(),
-        )
-        lms = LmsClient(settings.lms_base_url, settings.lms_hmac_secret.get_secret_value())
+    s3 = _build_s3_gateway(settings)
+    lms = _build_lms_client(settings)
 
     pipeline = Pipeline(
         scanner=scanner,
