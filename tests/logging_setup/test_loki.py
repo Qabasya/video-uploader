@@ -36,7 +36,7 @@ class TestPushFormat:
         body = json.loads(request.content.decode("utf-8"))
         stream = body["streams"][0]
         assert stream["stream"]["service"] == "fs-video-uploader"
-        assert stream["stream"]["level"] == "INFO"
+        assert stream["stream"]["level"] == "info"  # lowercase — единый вид с fs-adsync
         assert stream["stream"]["logger"] == "video_uploader.some.module"
         assert len(stream["values"]) == 1
         timestamp_ns, line = stream["values"][0]
@@ -58,6 +58,23 @@ class TestPushFormat:
 
         body = json.loads(captured[0].content.decode("utf-8"))
         assert body["streams"][0]["values"][0][1] == "PREFIX: текст"
+
+    def test_custom_service_label(self) -> None:
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(204)
+
+        loki_handler = LokiHandler(
+            "http://loki.local", service="fs-adsync", transport=httpx.MockTransport(handler)
+        )
+        loki_handler.emit(make_record())
+
+        import json
+
+        body = json.loads(captured[0].content.decode("utf-8"))
+        assert body["streams"][0]["stream"]["service"] == "fs-adsync"
 
 
 class TestNetworkErrors:
@@ -81,6 +98,41 @@ class TestNetworkErrors:
 
         record = make_record()
         loki_handler.emit(record)
+
+        assert calls == [record]
+
+    def test_non_2xx_loki_response_calls_handle_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Раньше ответ Loki не проверялся (не было raise_for_status()) — 5xx терялись молча."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500)
+
+        loki_handler = LokiHandler("http://loki.local", transport=httpx.MockTransport(handler))
+
+        calls: list[logging.LogRecord] = []
+        monkeypatch.setattr(loki_handler, "handleError", calls.append)
+
+        record = make_record()
+        loki_handler.emit(record)
+
+        assert calls == [record]
+
+    def test_emit_after_close_does_not_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Регрессия: RuntimeError('client has been closed') раньше не ловился —
+        ``except httpx.HTTPError`` его не покрывал, и хендлер ронял вызывающий поток
+        (пайплайн падал целиком при попытке залогировать после закрытия клиента)."""
+        loki_handler = LokiHandler(
+            "http://loki.local", transport=httpx.MockTransport(lambda request: httpx.Response(204))
+        )
+        loki_handler.close()
+
+        calls: list[logging.LogRecord] = []
+        monkeypatch.setattr(loki_handler, "handleError", calls.append)
+
+        record = make_record()
+        loki_handler.emit(record)  # не должно бросать RuntimeError
 
         assert calls == [record]
 

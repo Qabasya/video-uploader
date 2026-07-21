@@ -1086,3 +1086,33 @@ def create_app(*, repo: StateRepository, worker: ScanWorkerLike) -> FastAPI:
 - [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 225/225 тестов.
 - [x] Ревью Claude — код и тесты написаны Claude по вашей прямой просьбе.
 - [ ] Коммит — на вашей стороне.
+
+---
+
+## Доп. правка — найден и исправлен реальный краш `LokiHandler`, унификация логов с `fs-adsync`
+
+**Дата:** 2026-07-21. По жалобе на прод-ошибку (`tail` лога `/opt/video-uploader/data/logs/*.log` на `VideoUpdate`) и на сильное расхождение вида логов со вторым сервисом (`/Users/daniil/Python/AdSync`).
+
+**Найденный баг (не косметика — реально роняет фоновый воркер):** `LokiHandler.emit()` ловил только `except httpx.HTTPError`. Если внутренний `httpx.Client` уже закрыт (`self._client.close()` вызван, например, штатным `logging.shutdown()` на выходе процесса), `httpx` бросает **`RuntimeError("Cannot send a request, as the client has been closed.")`** — это не подкласс `httpx.HTTPError`, старый `except` его не ловил. Дальше по цепочке: `logger.exception(...)` в `pipeline.py::_fail` падает с этим `RuntimeError` → пробрасывается вверх до `ScanWorker.run()`, где ВТОРОЙ вызов `logger.exception("необработанная ошибка цикла сканирования")` **тоже** падает на том же `RuntimeError` (клиент всё ещё закрыт) — и на этот раз ловить некому: исключение вылетает из `ScanWorker.run()` целиком и **фоновый поток сканирования молча умирает** (не daemon-поток, но join уже не нужен: он просто прекращает существовать). HTTP API (`/health` и т.п.) продолжает отвечать «ок» — создаётся ложное впечатление, что сервис жив, хотя сканирование навсегда остановлено. Именно эта картина видна в присланном логе (`tail -50` показывает ровно эту цепочку: `_fail` → `logger.exception` → `loki.py:34 emit` → `RuntimeError`, повторённую как «During handling of the above exception»).
+
+**Сверка с `fs-adsync` (`src/logging_setup.py`) показала эталонный паттерн**, который в `video-uploader` не был соблюдён:
+- `except Exception: self.handleError(record)` вокруг **всего** push (это и есть контракт `logging.Handler.emit()` — падение хендлера логирования никогда не должно ронять вызывающий код), а не только сетевых `httpx.HTTPError`.
+- `response.raise_for_status()` — иначе 4xx/5xx от самого Loki (не сетевая ошибка, а именно отказ сервера) молча игнорировались, `video-uploader` этого не делал вообще.
+- Формат Loki-строки **без `asctime`** — Loki и так хранит свою метку времени (`timestamp_ns` = `record.created`), дублировать её текстом в самой строке избыточно; `video-uploader` использовал один и тот же формат для файла и для Loki.
+- Лейбл `level` — lowercase (`record.levelname.lower()`), не `INFO`/`ERROR` как есть — единообразие с `fs-adsync` важно, оба сервиса пушат в один Grafana Loki, разный регистр лейбла ломает общие дашборды/алерты (`level="error"` не поймает `level="ERROR"`).
+- `service` — параметр конструктора (`service: str = "fs-video-uploader"`), не модульная константа — как в `fs-adsync` (`service: str = "fs-adsync"`).
+
+**Изменения:**
+
+- `video_uploader/logging_setup/loki.py`: `except Exception` вместо `except httpx.HTTPError`; `response.raise_for_status()`; `level` — lowercase; `service` — конструкторский параметр.
+- `video_uploader/logging_setup/factory.py`: раздельные форматы — `_FILE_FORMAT` (с `asctime`, для файла) и `_LOKI_FORMAT` (без `asctime`, для Loki); убран общий `-8s` паддинг `levelname` (косметика, для единообразия текста с `fs-adsync`, у которого паддинга нет).
+- `.docs/CLAUDE.md`, раздел Logging & Notifications — короткое уточнение про унификацию с `fs-adsync` и что любая ошибка push уходит в `handleError`, не роняя пайплайн.
+- Тесты `tests/logging_setup/test_loki.py`: новый прямой регресс-тест `test_emit_after_close_does_not_raise` (закрывает клиент, потом `emit()` — раньше падало с `RuntimeError`, теперь уходит в `handleError`); тест на 5xx-ответ Loki (`raise_for_status`); тест на кастомный `service`; существующий тест уровня обновлён под lowercase.
+- Тесты `tests/logging_setup/test_factory.py`: новый тест `test_loki_formatter_omits_asctime` — форматтеры файла и Loki дают разный текст для одной записи.
+
+**Definition of Done:**
+
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 229/229 тестов.
+- [x] Ревью Claude — код и тесты написаны Claude по вашей прямой просьбе.
+- [ ] **Важно:** это исправление нужно раскатить на прод (`VideoUpdate`) отдельным деплоем — старый образ с этим багом всё ещё может «тихо» держать сканирование остановленным после следующего перезапуска/редеплоя, пока не будет обновлён. Проверить после раскатки: `docker compose logs -f` не показывает больше `RuntimeError: Cannot send a request` и `/status` продолжает обновлять `last_scan_at` спустя много циклов (не залипает).
+- [ ] Коммит — на вашей стороне.

@@ -14,7 +14,12 @@ from video_uploader.logging_setup.loki import LokiHandler
 _LOGGER_NAME = "video_uploader"
 _LOG_FILE_MAX_BYTES = 10 * 1024 * 1024
 _LOG_FILE_BACKUP_COUNT = 5
-_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+_FILE_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+# Без времени: Loki сам хранит и показывает время записи (передаём record.created в
+# timestamp_ns при push) — свой asctime в тексте строки дублировал бы ту же метку в
+# Grafana. Формат унифицирован с fs-adsync (второй сервис, тот же Loki) — см. его
+# src/logging_setup.py.
+_LOKI_FORMAT = "%(levelname)s %(name)s: %(message)s"
 
 
 def configure_logging(settings: Settings) -> None:
@@ -24,8 +29,6 @@ def configure_logging(settings: Settings) -> None:
     logger.propagate = False
     logger.handlers.clear()
 
-    formatter = logging.Formatter(_FORMAT)
-
     logs_dir = settings.data_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     file_handler = RotatingFileHandler(
@@ -34,10 +37,10 @@ def configure_logging(settings: Settings) -> None:
         backupCount=_LOG_FILE_BACKUP_COUNT,
         encoding="utf-8",
     )
-    file_handler.setFormatter(formatter)
+    file_handler.setFormatter(logging.Formatter(_FILE_FORMAT))
     logger.addHandler(file_handler)
 
     if settings.loki_url is not None:
         loki_handler = LokiHandler(settings.loki_url)
-        loki_handler.setFormatter(formatter)
+        loki_handler.setFormatter(logging.Formatter(_LOKI_FORMAT))
         logger.addHandler(loki_handler)

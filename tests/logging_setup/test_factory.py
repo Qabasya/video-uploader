@@ -68,3 +68,16 @@ class TestLoggerConfig:
         log_file = tmp_path / "logs" / "uploader.log"
         assert log_file.exists()
         assert "тестовое сообщение для проверки доставки" in log_file.read_text(encoding="utf-8")
+
+    def test_loki_formatter_omits_asctime(self, tmp_path: Path) -> None:
+        """Loki хранит свою метку времени (record.created в timestamp_ns) — в тексте
+        строки дублировать её не нужно (в отличие от файлового лога); см. fs-adsync."""
+        configure_logging(make_settings(tmp_path, loki_url="http://loki.local"))
+        logger = logging.getLogger("video_uploader")
+        loki_handler = next(h for h in logger.handlers if isinstance(h, LokiHandler))
+        file_handler = next(
+            h for h in logger.handlers if isinstance(h, logging.handlers.RotatingFileHandler)
+        )
+        record = logger.makeRecord("video_uploader", logging.INFO, __file__, 1, "msg", (), None)
+        assert file_handler.format(record) != loki_handler.format(record)
+        assert "msg" in loki_handler.format(record)

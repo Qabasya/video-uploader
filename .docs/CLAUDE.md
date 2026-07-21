@@ -224,7 +224,7 @@ groups:
 
 - Только stdlib `logging`; хендлеры собирает `logging_setup/factory.py` из `Settings`:
   - file — `RotatingFileHandler` `DATA_DIR/logs/uploader.log` (10 MiB × 5), всегда включён;
-  - loki — HTTP push (`/loki/api/v1/push`), включается при заданном `LOKI_URL`;
+  - loki — HTTP push (`/loki/api/v1/push`), включается при заданном `LOKI_URL`; формат и лейблы (`service`, `level` — lowercase, `logger`) унифицированы с `fs-adsync` (второй сервис, тот же Loki): в тексте строки нет `asctime` (дублировал бы `timestamp_ns` самого push), любая ошибка push (сетевая, non-2xx от Loki, закрытый на shutdown клиент) уходит в `handleError`, не роняя пайплайн;
   - telegram — только `ERROR`+, включается при `TELEGRAM_*`; защита от флуда (одинаковый текст не чаще 1 раза в 30 с).
 - Бизнес-уведомления (успешная загрузка, финальный сбой) — это **не логи**: их шлют подписчики EventBus из `notifications/` тем же Telegram Bot API через httpx.
 
