@@ -28,12 +28,24 @@ class LokiHandler(logging.Handler):
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         super().__init__()
+        self._url = url
         self._service = service
-        self._client = httpx.Client(base_url=url, timeout=_TIMEOUT_SECONDS, transport=transport)
+        self._transport = transport
+        self._client = self._build_client()
+
+    def _build_client(self) -> httpx.Client:
+        return httpx.Client(base_url=self._url, timeout=_TIMEOUT_SECONDS, transport=self._transport)
 
     def emit(self, record: logging.LogRecord) -> None:
         """Формирует один stream с одной парой (timestamp_ns, formatted_line)."""
         try:
+            if self._client.is_closed:
+                # На проде клиент периодически оказывается закрытым не через явный
+                # close() этого хендлера (см. .docs/Tasks.md — источник не
+                # локализован статическим анализом, несмотря на разбор). Тихая
+                # потеря ВСЕЙ доставки в Loki до конца жизни процесса хуже, чем
+                # прозрачно пересобрать клиент и продолжить попытки push.
+                self._client = self._build_client()
             body = {
                 "streams": [
                     {

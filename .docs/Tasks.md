@@ -1158,3 +1158,38 @@ def create_app(*, repo: StateRepository, worker: ScanWorkerLike) -> FastAPI:
 ### Параллельно: аналогичная доработка `fs-adsync` (второй репозиторий)
 
 Отдельный git-репозиторий (`/Users/daniil/Python/AdSync`), свой `CLAUDE.md`/`Tasks.md` — детали см. там же (heartbeat через `JobRepository.status_counts()` + третий `_loop()`-поток по образцу jobs/reconcile, `HEARTBEAT_INTERVAL_SECONDS`, default 3600). Старт/стоп-логи и уровни у него уже были в порядке, править не потребовалось.
+
+---
+
+## Доп. правка — `LokiHandler` пересобирает клиент сам; устранён конфликт сигналов uvicorn/наш shutdown
+
+**Дата:** 2026-07-21. Продовый лог (`VideoUpdate`) показал: `RuntimeError: Cannot send a request, as the client has been closed.` продолжает возникать **уже с исправленным** `except Exception` из предыдущей правки — теперь она честно ловится и уходит в `handleError` (краша и смерти потока сканирования больше нет — подтверждено логом: `видео обнаружено` → `видео загружено` → `видео верифицировано` → регистрация → cleanup прошли до конца, несмотря на непрерывный отказ Loki на каждом шаге), но **сама доставка в Loki оставалась полностью потерянной до конца жизни процесса** — раз клиент закрыт, `except httpx.HTTPError`/`except Exception` не открывают его заново.
+
+**Расследование причины закрытия (важное отличие от `fs-adsync`, у которого этот баг не наблюдается):**
+
+- `httpx.Client._state = ClientState.CLOSED` выставляется **только** в `Client.close()`/`__exit__` (проверено по исходникам `httpx==0.28.1` — `grep` по всем присвоениям `_state`, других путей нет).
+- В коде `LokiHandler.close()` явно не вызывается нигде, кроме самого метода `close()`; единственный автоматический вызывающий — `logging.shutdown()` (`atexit`, при завершении интерпретатора).
+- Но трейс продового лога показывал сбой **посреди обычной работы** — стек вызова оканчивается на `ScanWorker.run() → self._pipeline.run_cycle()`, то есть поток сканирования в этот момент активно исполняется, а не находится в `finally`-блоке `main()` после `worker_thread.join()`. Значит закрытие происходит не через штатный путь нашего же graceful shutdown.
+- **Структурное отличие от `fs-adsync`:** там `uvicorn.Server(...).run()` запускается в отдельном daemon-потоке, а сигналами управляет собственный `signal.signal()` в `main()` — с их же комментарием «uvicorn пропускает установку своих обработчиков сигналов, если запущен не из главного потока» (подтверждено чтением `uvicorn/server.py::Server.capture_signals()`: `if threading.current_thread() is not threading.main_thread(): yield; return`). В video-uploader `uvicorn.run(app, ...)` вызывался **в главном потоке** — уvicorn сам ставил `signal.signal()` на SIGTERM/SIGINT (через `capture_signals()`), **параллельно** с нашим собственным `finally: worker.stop(); worker_thread.join(); ...`. Двух независимых механизмов остановки в одном процессе достаточно, чтобы объяснить сбой, не сводящийся к тривиальной гонке, которую видно в статическом коде — конкретный триггер (например, повторный/быстрый SIGTERM при `docker compose restart`) не подтверждён вживую, но устранение самой возможности конфликта — правильный шаг независимо от точного триггера.
+
+**Решения:**
+
+1. **`LokiHandler` — самовосстановление**: `emit()` теперь проверяет `self._client.is_closed` и прозрачно пересобирает `httpx.Client` (`_build_client()`) перед отправкой. Не устраняет причину закрытия, но гарантирует, что доставка в Loki восстанавливается на следующей же записи, а не теряется навсегда до перезапуска контейнера. Тот же паттерн применён в `fs-adsync` (`src/logging_setup.py`) — на случай, если там тоже когда-нибудь проявится (по объяснённой выше причине — маловероятно, но защита дешёвая).
+2. **`main.py` — архитектурное исправление, устраняющее саму возможность конфликта**: uvicorn теперь поднимается через `uvicorn.Server(uvicorn.Config(app, ...)).run()` в отдельном `daemon=True`-потоке (как `worker_thread`, тоже теперь `daemon=True`); сигналами SIGTERM/SIGINT управляет только наш `signal.signal(handle_signal)` в главном потоке — один явный, контролируемый путь остановки, один в один как в `fs-adsync`. `handle_signal` устанавливает `stop`-Event, `worker.stop()` и `server.should_exit = True`; главный поток блокируется на `stop.wait()`, затем джойнит оба потока с таймаутом `_SHUTDOWN_JOIN_TIMEOUT_SECONDS = 10.0` (раньше `worker_thread.join()` был без таймаута — теоретически мог зависнуть навечно, если `run_cycle()` застрянет на сетевом вызове без собственного таймаута).
+3. **`log_config` uvicorn не трогаем** (в отличие от `fs-adsync`, который передаёт `log_config=None`) — баннер `INFO: Started server process...`/`Uvicorn running on...` в `docker logs` полезен и используется для диагностики (видно в присланных пользователем логах), убирать не за чем: связь была именно в том, из какого потока запускается `Server.run()`, а не в `log_config`.
+
+### Задачи
+
+- [x] `logging_setup/loki.py`: `_build_client()`, самовосстановление в `emit()` при `is_closed`.
+- [x] `main.py`: `uvicorn.Server`/`uvicorn.Config` вместо `uvicorn.run()`; `api_thread`/`worker_thread` — оба `daemon=True`; собственный `signal.signal(SIGTERM/SIGINT, handle_signal)`; `stop`-Event; join с таймаутом 10 с.
+- [x] Тест `tests/logging_setup/test_loki.py::test_emit_after_close_self_heals_and_delivers` переписан под новое поведение (раньше проверял только «не падает», теперь — что запись реально доставляется после пересборки).
+- [x] Синхронно в `fs-adsync`: тот же self-heal в `src/logging_setup.py::LokiHandler` + новый тест `test_emit_after_close_self_heals_and_delivers` в `tests/test_logging_setup.py` (у него архитектура уже была правильная — потоковая модель менять не потребовалось).
+- [x] **Ручная проверка graceful shutdown выполнена по-настоящему** (не просто чтение кода): локальный запуск с `DRY_RUN=true`, `SCAN_INTERVAL_SECONDS=5` → `GET /health` (`last_scan_at` уже проставлен — воркер реально работает в фоне) → `GET /status` → `kill -TERM <pid>`. Результат в файловом логе: `получен сигнал 15, начинаю остановку` → (uvicorn сам корректно завершился: `Shutting down` → `Application shutdown complete` → `Finished server process`) → `fs-video-uploader остановлен`. Процесс полностью завершился (`ps aux` пуст) за < 2 секунд, без зависаний, без гонки между uvicorn и нашим shutdown.
+
+### Definition of Done
+
+- [x] video-uploader: `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 234/234.
+- [x] fs-adsync: `uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest` — чисто, 90/90.
+- [x] Ревью Claude — код и тесты написаны Claude по вашей прямой просьбе («да, сделай сейчас»).
+- [ ] На проде: раскатить обновлённый образ, понаблюдать несколько дней — если `RuntimeError: Cannot send a request` в логе больше не появляется вообще (не только не роняет поток, а вообще не возникает), это будет косвенным подтверждением диагноза выше. Если продолжит появляться даже с новой потоковой моделью — вернуться к более глубокому расследованию (например, добавить `logging.raiseExceptions`-трейс прямо в момент `close()`, если он всё же случится).
+- [ ] Коммит — на вашей стороне (в обоих репозиториях).

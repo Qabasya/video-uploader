@@ -76,7 +76,7 @@ uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv 
 
 | Модуль (`video_uploader/`) | Роль |
 |---|---|
-| `main.py` | Composition root: конфиг → сборка зависимостей → воркер (фоновый поток) + uvicorn; graceful shutdown по SIGTERM |
+| `main.py` | Composition root: конфиг → сборка зависимостей → воркер и uvicorn — оба в daemon-потоках; graceful shutdown по SIGTERM/SIGINT через собственный `signal.signal()` в главном потоке (единообразно с `fs-adsync`) |
 | `config.py` | `Settings` (pydantic-settings; источник — env/`.env`) |
 | `domain/models.py` | `VideoFile`, `LessonMeta`, `UploadResult` — frozen dataclasses |
 | `domain/events.py` | Доменные события + `EventBus` (Observer): `subscribe` / `publish` |

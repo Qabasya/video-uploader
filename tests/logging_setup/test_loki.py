@@ -119,14 +119,26 @@ class TestNetworkErrors:
 
         assert calls == [record]
 
-    def test_emit_after_close_does_not_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Регрессия: RuntimeError('client has been closed') раньше не ловился —
-        ``except httpx.HTTPError`` его не покрывал, и хендлер ронял вызывающий поток
-        (пайплайн падал целиком при попытке залогировать после закрытия клиента)."""
-        loki_handler = LokiHandler(
-            "http://loki.local", transport=httpx.MockTransport(lambda request: httpx.Response(204))
-        )
+    def test_emit_after_close_self_heals_and_delivers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Регрессия: RuntimeError('client has been closed') раньше не ловился вообще
+        (``except httpx.HTTPError`` его не покрывал) и ронял вызывающий поток целиком.
+
+        На проде клиент оказывался закрытым не через явный ``close()`` этого хендлера
+        (см. `.docs/Tasks.md`) даже без штатного shutdown — поэтому недостаточно просто
+        не падать: хендлер обязан САМ пересобрать клиент и всё же доставить запись, а не
+        молча терять всю доставку в Loki до конца жизни процесса.
+        """
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(204)
+
+        loki_handler = LokiHandler("http://loki.local", transport=httpx.MockTransport(handler))
         loki_handler.close()
+        assert loki_handler._client.is_closed
 
         calls: list[logging.LogRecord] = []
         monkeypatch.setattr(loki_handler, "handleError", calls.append)
@@ -134,7 +146,9 @@ class TestNetworkErrors:
         record = make_record()
         loki_handler.emit(record)  # не должно бросать RuntimeError
 
-        assert calls == [record]
+        assert calls == []  # успех после пересборки — handleError не вызывался
+        assert len(captured) == 1
+        assert not loki_handler._client.is_closed  # новый клиент открыт
 
 
 class TestClose:

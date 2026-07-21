@@ -1,14 +1,16 @@
 """Composition root сервиса.
 
 Сборка зависимостей из ``Settings``, фоновый воркер сканирования, uvicorn для
-HTTP-API и graceful shutdown по SIGTERM.
+HTTP-API и graceful shutdown по SIGTERM/SIGINT.
 """
 
 import logging
+import signal
 import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from types import FrameType
 from typing import Protocol
 
 import uvicorn
@@ -30,6 +32,8 @@ from video_uploader.storage.key_builder import KeyBuilder
 from video_uploader.storage.s3_gateway import S3Gateway
 
 logger = logging.getLogger(__name__)
+
+_SHUTDOWN_JOIN_TIMEOUT_SECONDS = 10.0
 
 
 class RegistryCounts(Protocol):
@@ -196,15 +200,35 @@ def main() -> None:
         repo=repo,
         heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
     )
-    worker_thread = threading.Thread(target=worker.run, name="scan-worker")
-    worker_thread.start()
+    worker_thread = threading.Thread(target=worker.run, name="scan-worker", daemon=True)
 
     app = create_app(repo=repo, worker=worker)
-    try:
-        uvicorn.run(app, host="0.0.0.0", port=settings.api_port)
-    finally:
+    server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=settings.api_port))
+    # uvicorn пропускает установку своих обработчиков сигналов, если запущен не из
+    # главного потока (`Server.capture_signals`) — сигналами управляет только main(),
+    # без конфликта. Тот же приём, что в fs-adsync: раньше uvicorn.run() из главного
+    # потока сам ставил обработчики SIGTERM/SIGINT параллельно нашему graceful
+    # shutdown — расследование конкретного сбоя из-за этого см. `.docs/Tasks.md`.
+    api_thread = threading.Thread(target=server.run, name="api", daemon=True)
+
+    stop = threading.Event()
+
+    def handle_signal(signum: int, _frame: FrameType | None) -> None:
+        logger.info("получен сигнал %s, начинаю остановку", signum)
+        stop.set()
         worker.stop()
-        worker_thread.join()
-        s3.close()
-        lms.close()
-        logger.info("fs-video-uploader остановлен")
+        server.should_exit = True
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    worker_thread.start()
+    api_thread.start()
+
+    stop.wait()
+    worker_thread.join(timeout=_SHUTDOWN_JOIN_TIMEOUT_SECONDS)
+    api_thread.join(timeout=_SHUTDOWN_JOIN_TIMEOUT_SECONDS)
+
+    s3.close()
+    lms.close()
+    logger.info("fs-video-uploader остановлен")
