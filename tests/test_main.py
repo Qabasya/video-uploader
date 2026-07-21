@@ -1,9 +1,12 @@
 """Тесты ScanWorker и dry-run заглушек: фоновый цикл, rescan-триггер, изоляция ошибок."""
 
+import logging
 import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+
+import pytest
 
 from video_uploader.config import Settings
 from video_uploader.lms.client import LmsClient
@@ -60,10 +63,36 @@ def start(worker: ScanWorker) -> threading.Thread:
     return thread
 
 
+class FakeRegistryCounts:
+    """Фейк RegistryCounts: фиксированный словарь для heartbeat-сводки."""
+
+    def __init__(self, counts: dict[str, int] | None = None) -> None:
+        self._counts = counts if counts is not None else {}
+
+    def count_by_status(self) -> dict[str, int]:
+        return self._counts
+
+
+def make_worker(
+    pipeline: FakePipeline,
+    *,
+    scan_interval_seconds: int = 60,
+    repo: FakeRegistryCounts | None = None,
+    heartbeat_interval_seconds: int = 3600,
+) -> ScanWorker:
+    """ScanWorker с безопасными по умолчанию heartbeat-параметрами для тестов не про heartbeat."""
+    return ScanWorker(
+        pipeline,
+        scan_interval_seconds=scan_interval_seconds,
+        repo=repo if repo is not None else FakeRegistryCounts(),
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+    )
+
+
 class TestLifecycle:
     def test_stop_terminates_thread(self) -> None:
         pipeline = FakePipeline()
-        worker = ScanWorker(pipeline, scan_interval_seconds=60)
+        worker = make_worker(pipeline)
         thread = start(worker)
 
         assert wait_until(lambda: pipeline.call_count >= 1)
@@ -74,7 +103,7 @@ class TestLifecycle:
 
     def test_last_scan_at_updates_after_each_cycle(self) -> None:
         pipeline = FakePipeline()
-        worker = ScanWorker(pipeline, scan_interval_seconds=60)
+        worker = make_worker(pipeline)
         thread = start(worker)
 
         assert wait_until(lambda: worker.last_scan_at is not None)
@@ -91,7 +120,7 @@ class TestLifecycle:
 class TestRequestRescan:
     def test_wakes_up_immediately_without_waiting_full_interval(self) -> None:
         pipeline = FakePipeline()
-        worker = ScanWorker(pipeline, scan_interval_seconds=60)
+        worker = make_worker(pipeline)
         thread = start(worker)
 
         assert wait_until(lambda: pipeline.call_count >= 1)
@@ -110,7 +139,7 @@ class TestRequestRescan:
 class TestErrorIsolation:
     def test_exception_in_run_cycle_does_not_kill_thread(self) -> None:
         pipeline = FakePipeline(fail_first_n=1)
-        worker = ScanWorker(pipeline, scan_interval_seconds=60)
+        worker = make_worker(pipeline)
         thread = start(worker)
 
         assert wait_until(lambda: pipeline.call_count >= 1)
@@ -138,8 +167,40 @@ class TestDryRunS3Gateway:
 class TestDryRunLmsClient:
     def test_register_does_not_raise(self) -> None:
         client = DryRunLmsClient()
-        client.register({"s3_key": "videos/kege-1/rec.webm"})
+        assert client.register({"s3_key": "videos/kege-1/rec.webm"}) is True
         client.close()
+
+
+class TestHeartbeat:
+    def test_does_not_fire_before_interval_elapses(self, caplog: pytest.LogCaptureFixture) -> None:
+        pipeline = FakePipeline()
+        worker = make_worker(pipeline, heartbeat_interval_seconds=9999)
+        with caplog.at_level(logging.INFO, logger="video_uploader.main"):
+            thread = start(worker)
+            assert wait_until(lambda: pipeline.call_count >= 1)
+            worker.request_rescan()
+            assert wait_until(lambda: pipeline.call_count >= 2)
+            worker.stop()
+            thread.join(timeout=2.0)
+
+        assert not any("сервис жив" in r.message for r in caplog.records)
+
+    def test_fires_with_registry_counts_when_due(self, caplog: pytest.LogCaptureFixture) -> None:
+        pipeline = FakePipeline()
+        repo = FakeRegistryCounts({"registered": 3, "failed": 1})
+        # interval=0: «прошло достаточно времени» истинно уже на первом цикле — без
+        # флейки на реальном времени ожидания проверяем, что механизм вообще срабатывает.
+        worker = make_worker(pipeline, repo=repo, heartbeat_interval_seconds=0)
+        with caplog.at_level(logging.INFO, logger="video_uploader.main"):
+            thread = start(worker)
+            assert wait_until(lambda: pipeline.call_count >= 1)
+            worker.stop()
+            thread.join(timeout=2.0)
+
+        heartbeats = [r for r in caplog.records if "сервис жив" in r.message]
+        assert len(heartbeats) >= 1
+        assert "registered" in heartbeats[0].message
+        assert "failed" in heartbeats[0].message
 
 
 class TestBuildGateways:

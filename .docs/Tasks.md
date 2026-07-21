@@ -1116,3 +1116,45 @@ def create_app(*, repo: StateRepository, worker: ScanWorkerLike) -> FastAPI:
 - [x] Ревью Claude — код и тесты написаны Claude по вашей прямой просьбе.
 - [ ] **Важно:** это исправление нужно раскатить на прод (`VideoUpdate`) отдельным деплоем — старый образ с этим багом всё ещё может «тихо» держать сканирование остановленным после следующего перезапуска/редеплоя, пока не будет обновлён. Проверить после раскатки: `docker compose logs -f` не показывает больше `RuntimeError: Cannot send a request` и `/status` продолжает обновлять `last_scan_at` спустя много циклов (не залипает).
 - [ ] Коммит — на вашей стороне.
+
+---
+
+## Доп. правка — старт/стоп/heartbeat-логи, различие «полный успех» vs «зарегистрировано без матчинга», видимость окончательного отказа; unификация с `fs-adsync`
+
+**Дата:** 2026-07-21. По итогам реального прогона на `VideoUpdate` (лог из предыдущей правки) всплыли два новых наблюдения:
+
+1. **`LMS 400: missing s3_bucket or s3_key`** — не баг сервиса: в тестовом `.env`/`VU.env` `S3_BUCKET` был пустой строкой. Это `str`-поле без валидатора «пустое → ошибка» (в отличие от опциональных полей вроде `LOKI_URL`), пустая строка проходит `Settings` и уходит в `_build_lms_payload` как `"s3_bucket": ""` — плагин считает это отсутствующим полем. Для теста с `DRY_RUN_LMS_LIVE=true` `S3_BUCKET` всё равно нужен непустым, хотя S3 реально не трогается. Кода это не касается — чисто конфигурация.
+2. Эта ошибка — `LmsRejectedError` (4xx) — по контракту CLAUDE.md permanent, ретраев не будет. `_fail(permanent=True)` сразу выставляет `attempts = MAX_ATTEMPTS`. На следующих циклах `_process()` тихо выходит на `if state.status == "failed" and attempts >= max_attempts: return` — **без единого лога**. Отсюда и «загрузил то же видео (тот же путь), лога не получил» — файл был не «не найден», а молча заблокирован реестром навсегда (по конструкции: `path` уникален, `sha256`-дедуп не выручает для статуса `failed`).
+
+Дополнительно (прямой запрос): в текущих логах не видно, что сервис вообще жив/поднялся, и нет отдельного «success»-лога на полностью пройденный цикл файла (плагин принял и замэтчил видео).
+
+**Сверка с `fs-adsync`** (`/Users/daniil/Python/AdSync`) показала: у него **уже есть** старт/стоп-логи (`main.py:110,211`) и чёткая семантика уровней (INFO/WARNING/ERROR по тому же принципу, что описан в CLAUDE.md AdSync, раздел Logging & Notifications), но **нет heartbeat** — единственный кандидат (лог числа заданий за тик) был осознанно закомментирован в последнем коммите (`ebc1bbb`) из-за шума (тикает каждые 3 с). Важно: AdSync **сознательно не заводит новых Loki-лейблов** (только `service`/`level`/`logger` — прямая цитата его CLAUDE.md) и не строит отдельных абстракций уведомлений (`EventBus`/`notifier` реверчены на этапе 8 их `Tasks.md`) — «просто логируем на нужном уровне, алерты — через Grafana поверх Loki». Поэтому унификация — **не** общий `event`-лейбл (это бы разошлось с их явным решением), а одинаковая архитектура хендлеров (уже сделано прошлой правкой) + одинаковая семантика уровней + добавление heartbeat в **оба** сервиса.
+
+### Решения
+
+1. **Heartbeat — не лейбл, а обычный INFO-лог** `сервис жив: реестр=<counts>` раз в `HEARTBEAT_INTERVAL_SECONDS` (новый флаг, default 3600). Не в `Pipeline`/`run_cycle` (это была бы логика на каждый цикл сканирования, `SCAN_INTERVAL_SECONDS` default 300 с — слишком часто) — в `ScanWorker` (`main.py`), которому и так принадлежит понятие «фоновый цикл потока». Источник цифр — уже существующий `StateRepository.count_by_status()`.
+2. **Первый heartbeat не срабатывает мгновенно при старте**, а ждёт полный интервал — так же, как первый тик `_loop()` в `fs-adsync` (`while not stop.wait(interval): tick()` — сначала `wait`, потом тик). Раз старт уже подтверждён отдельным логом «запускается», немедленный heartbeat был бы дублирующим сигналом.
+3. **Узкий Protocol `RegistryCounts`** (`count_by_status() -> dict[str, int]`) вместо завязки `ScanWorker` на весь `StateRepository` — тот же SOLID-I, что у `ScanWorkerLike` в `api/app.py`.
+4. **`RegistrationClient.register()` теперь возвращает `bool` (`matched`)**, а не `None`. Раньше `LmsClient._log_match_status` логировал `matched: false` WARNING-ом без контекста файла (`video_uploader.lms.client`, только «занятие не найдено» без пути/ключа). Теперь транспортный слой (`lms/client.py`) только извлекает флаг (`_extract_matched`), а `pipeline.py` — единственное место, которое решает, что писать в лог, с полным контекстом (`video_file.path`, `s3_key`): `matched: true` → INFO «видео полностью обработано» (это и есть запрошенный success-лог на весь пройденный цикл файла); `matched: false` → WARNING «зарегистрировано, но занятие не найдено — нужна ручная привязка». `DryRunLmsClient`/`FakeLmsClient` — всегда `True` (dry-run по-прежнему «притворяется полным успехом»).
+5. **Одноразовое предупреждение на файл, окончательно исчерпавший попытки** (`Pipeline._warned_exhausted_ids: set[int]`, по образцу `warned_folders` для `GroupUnmapped`, только на уровне экземпляра `Pipeline`, не одного `run_cycle`): при первом же повторном скане такого файла — WARNING «видео больше не будет обработано — исчерпаны попытки, нужно вмешательство администратора», дальше молчит (не спамит на каждый цикл). Плюс отдельный ERROR **в момент**, когда `attempts` достигает `MAX_ATTEMPTS` (`_fail`, рядом с публикацией `VideoFailed`, которая раньше была вообще без лога) — «видео окончательно не обработано после N попыток, повторных попыток не будет».
+6. **Как разблокировать зависший `failed`-файл** (нет отдельного API/механизма, сознательно не строим один без вашего запроса): переименовать/перезалить файл под другим именем (дедуп по `sha256` не блокирует повторную обработку для статуса `failed`, только для `registered`/`archived`) **или** вручную удалить строку из `data/state.db` (`DELETE FROM files WHERE path = '...'`). Если нужен нормальный `POST /retry/{id}` — отдельная задача, скажите.
+
+### Задачи (video-uploader)
+
+- [x] `config.py`: `heartbeat_interval_seconds: int = Field(default=3600, ge=1)`.
+- [x] `main.py`: `RegistryCounts` (Protocol); `ScanWorker` принимает `repo`/`heartbeat_interval_seconds`, метод `_maybe_heartbeat()`; старт-лог после `configure_logging`, стоп-лог в конце `finally`; `DryRunLmsClient.register()` → `bool` (всегда `True`).
+- [x] `lms/client.py`: `register()` → `bool`; `_log_match_status` → `_extract_matched` (только возвращает флаг, не логирует).
+- [x] `pipeline.py`: `RegistrationClient.register()` → `bool`; `_process()` — matched/unmatched INFO/WARNING вместо общего «зарегистрировано»; `_replay_duplicate()` — та же формулировка success для дубликатов; `_fail()` — ERROR при достижении `MAX_ATTEMPTS`; `_warned_exhausted_ids` + одноразовый WARNING при скипе исчерпанного файла.
+- [x] `.env.example`, `.docs/CLAUDE.md` (таблица Configuration + раздел Logging & Notifications) — `HEARTBEAT_INTERVAL_SECONDS`, уровни, старт/стоп, heartbeat.
+- [x] Тесты: `tests/lms/test_client.py` (matched → bool, без caplog на этом уровне), `tests/test_pipeline.py` (`FakeLmsClient.register_matched`, обновлён текст в `TestHappyPath`, новый `TestUnmatched`, регресс-тесты в `TestRegisterRejected`/`TestMaxAttemptsExhausted` на оба новых лога), `tests/test_main.py` (`FakeRegistryCounts`, `make_worker()`, новый `TestHeartbeat`), `tests/test_config.py` (default + границы `heartbeat_interval_seconds`).
+
+### Definition of Done (video-uploader)
+
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 234/234 тестов.
+- [x] Ревью Claude — код и тесты написаны Claude по вашей прямой просьбе.
+- [ ] На тестовом хосте: поставить непустой `S3_BUCKET`, повторить прогон с `DRY_RUN_LMS_LIVE=true` — ожидается либо `видео полностью обработано` (если занятие в fs-lms нашлось), либо явный WARNING про ненайденное занятие — но не тишина.
+- [ ] Коммит — на вашей стороне.
+
+### Параллельно: аналогичная доработка `fs-adsync` (второй репозиторий)
+
+Отдельный git-репозиторий (`/Users/daniil/Python/AdSync`), свой `CLAUDE.md`/`Tasks.md` — детали см. там же (heartbeat через `JobRepository.status_counts()` + третий `_loop()`-поток по образцу jobs/reconcile, `HEARTBEAT_INTERVAL_SECONDS`, default 3600). Старт/стоп-логи и уровни у него уже были в порядке, править не потребовалось.

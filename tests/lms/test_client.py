@@ -3,7 +3,6 @@
 import hashlib
 import hmac
 import json
-import logging
 import time
 
 import httpx
@@ -79,6 +78,12 @@ class TestSuccess:
 
         client.register(PAYLOAD)  # не должно бросать исключений
 
+    def test_returns_true_when_no_body(self) -> None:
+        transport = httpx.MockTransport(lambda request: httpx.Response(200))
+        client = make_client(transport)
+
+        assert client.register(PAYLOAD) is True
+
     def test_sends_correct_path(self) -> None:
         client, captured = make_capturing_client()
 
@@ -88,35 +93,32 @@ class TestSuccess:
 
 
 class TestMatchedField:
-    def test_matched_true_no_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+    """С 2026-07-21 клиент только возвращает ``matched``; логирование — забота pipeline.py."""
+
+    def test_matched_true_returns_true(self) -> None:
         transport = httpx.MockTransport(
             lambda request: httpx.Response(200, json={"ok": True, "matched": True})
         )
         client = make_client(transport)
 
-        with caplog.at_level(logging.WARNING, logger="video_uploader.lms.client"):
-            client.register(PAYLOAD)
+        assert client.register(PAYLOAD) is True
 
-        assert caplog.text == ""
-
-    def test_matched_false_logs_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_matched_false_returns_false(self) -> None:
         transport = httpx.MockTransport(
             lambda request: httpx.Response(200, json={"ok": True, "matched": False})
         )
         client = make_client(transport)
 
-        with caplog.at_level(logging.WARNING, logger="video_uploader.lms.client"):
-            client.register(PAYLOAD)  # не должно бросать
+        assert client.register(PAYLOAD) is False  # не должно бросать
 
-        assert "занятие не найдено" in caplog.text
-
-    def test_invalid_json_body_does_not_raise(self) -> None:
+    def test_invalid_json_body_returns_true(self) -> None:
         transport = httpx.MockTransport(
             lambda request: httpx.Response(200, content=b"not json at all")
         )
         client = make_client(transport)
 
-        client.register(PAYLOAD)  # успех уже по статусу, парсинг matched — best-effort
+        # успех уже по статусу, парсинг matched — best-effort: неразбираемое тело не считаем отказом
+        assert client.register(PAYLOAD) is True
 
 
 class TestRetryable:

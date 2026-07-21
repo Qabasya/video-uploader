@@ -224,8 +224,11 @@ groups:
 
 - Только stdlib `logging`; хендлеры собирает `logging_setup/factory.py` из `Settings`:
   - file — `RotatingFileHandler` `DATA_DIR/logs/uploader.log` (10 MiB × 5), всегда включён;
-  - loki — HTTP push (`/loki/api/v1/push`), включается при заданном `LOKI_URL`; формат и лейблы (`service`, `level` — lowercase, `logger`) унифицированы с `fs-adsync` (второй сервис, тот же Loki): в тексте строки нет `asctime` (дублировал бы `timestamp_ns` самого push), любая ошибка push (сетевая, non-2xx от Loki, закрытый на shutdown клиент) уходит в `handleError`, не роняя пайплайн;
+  - loki — HTTP push (`/loki/api/v1/push`), включается при заданном `LOKI_URL`; формат и лейблы (`service`, `level` — lowercase, `logger`) унифицированы с `fs-adsync` (второй сервис, тот же Loki): в тексте строки нет `asctime` (дублировал бы `timestamp_ns` самого push), любая ошибка push (сетевая, non-2xx от Loki, закрытый на shutdown клиент) уходит в `handleError`, не роняя пайплайн. **Новых Loki-лейблов не заводим** (решение синхронизировано с `fs-adsync`, см. его CLAUDE.md, раздел Logging & Notifications) — низкая кардинальность только `service`/`level`/`logger`, всё остальное (путь, ключ S3, число попыток) — в тексте строки;
   - telegram — только `ERROR`+, включается при `TELEGRAM_*`; защита от флуда (одинаковый текст не чаще 1 раза в 30 с).
+- Уровни расставлены по тому же принципу, что в `fs-adsync`: INFO — успешные шаги (`видео обнаружено`, `видео загружено`, `видео верифицировано в S3`, `видео полностью обработано` — регистрация с `matched: true`, `видео перемещено в архив`); WARNING — некритичные аномалии, не требующие немедленной реакции (`DateFallback`, `GroupUnmapped`, регистрация с `matched: false` — занятие не найдено, файл, который больше не будет обработан из-за исчерпанных попыток, залогированный один раз при обнаружении); ERROR — требует внимания (`видео окончательно не обработано после N попыток` — публикуется вместе с `VideoFailed`, отдельно от `logger.exception` на каждой попытке).
+- **Старт/стоп-логи** (`main.py`): `fs-video-uploader запускается` (сразу после `configure_logging`, с флагами `dry_run`/`dry_run_lms_live`) и `fs-video-uploader остановлен` (в конце `finally` после закрытия всех клиентов) — единообразно с `fs-adsync` (`fs-adsync запускается`/`fs-adsync остановлен`).
+- **Heartbeat** (`ScanWorker._maybe_heartbeat`, `main.py`): раз в `HEARTBEAT_INTERVAL_SECONDS` — `сервис жив: реестр=<counts>` (сводка `StateRepository.count_by_status()`). Не завязан на `SCAN_INTERVAL_SECONDS` — иначе спамил бы каждый цикл сканирования; первый heartbeat, как и первый тик циклов `fs-adsync` (`_loop`), ждёт полный интервал, не срабатывает сразу при старте. Единственный признак того, что фоновый поток сканирования жив, а не тихо умер (см. `.docs/Tasks.md`, разбор краша `LokiHandler` — HTTP API мог отвечать `ok`, даже когда сканирование уже остановилось).
 - Бизнес-уведомления (успешная загрузка, финальный сбой) — это **не логи**: их шлют подписчики EventBus из `notifications/` тем же Telegram Bot API через httpx.
 
 ## Configuration
@@ -257,6 +260,7 @@ groups:
 | `LOKI_URL`                                    | — | Опция |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`      | — | Опция |
 | `API_PORT`                                    | `8090` | FastAPI |
+| `HEARTBEAT_INTERVAL_SECONDS`                  | `3600` | Период лога «сервис жив» (сводка реестра) — не завязан на `SCAN_INTERVAL_SECONDS` |
 
 ## HTTP API
 

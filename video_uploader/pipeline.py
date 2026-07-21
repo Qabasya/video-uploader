@@ -53,7 +53,7 @@ class UploadGateway(Protocol):
 class RegistrationClient(Protocol):
     """Узкий интерфейс регистрации в LMS, который использует pipeline."""
 
-    def register(self, payload: dict[str, object]) -> None: ...
+    def register(self, payload: dict[str, object]) -> bool: ...
 
 
 def _compute_sha256(path: Path) -> str:
@@ -154,6 +154,9 @@ class Pipeline:
         self._max_attempts = max_attempts
         self._skip_older_than_days = skip_older_than_days
         self._dry_run = dry_run
+        # Один раз на file_id — иначе файл, окончательно исчерпавший MAX_ATTEMPTS,
+        # молча пропускался бы каждый цикл сканирования без единого следа в логе.
+        self._warned_exhausted_ids: set[int] = set()
 
     def run_cycle(self) -> None:
         """Один проход по шаре: сканирует, обрабатывает каждый файл изолированно."""
@@ -188,6 +191,14 @@ class Pipeline:
         if state.status in ("archived", "skipped_old"):
             return
         if state.status == "failed" and state.attempts >= self._max_attempts:
+            if file_id not in self._warned_exhausted_ids:
+                self._warned_exhausted_ids.add(file_id)
+                logger.warning(
+                    "видео больше не будет обработано — исчерпаны попытки (%d), "
+                    "нужно вмешательство администратора: %s",
+                    state.attempts,
+                    video_file.path,
+                )
             return
         if state.status == "registered":
             assert state.sha256 is not None
@@ -279,9 +290,21 @@ class Pipeline:
             payload = _build_lms_payload(
                 self._bucket, s3_key, manifest_key, lesson, video_file, sha256
             )
-            self._lms.register(payload)
+            matched = self._lms.register(payload)
             self._repo.mark_registered(file_id)
-            logger.info("видео зарегистрировано в LMS: %s -> %s", video_file.path, s3_key)
+            if matched:
+                logger.info(
+                    "видео полностью обработано: %s -> %s (занятие найдено)",
+                    video_file.path,
+                    s3_key,
+                )
+            else:
+                logger.warning(
+                    "видео зарегистрировано, но занятие не найдено по дате/времени — "
+                    "нужна ручная привязка: %s -> %s",
+                    video_file.path,
+                    s3_key,
+                )
             self._events.publish(VideoRegistered(path=video_file.path, s3_key=s3_key))
 
         self._cleanup(file_id, video_file, sha256)
@@ -317,7 +340,8 @@ class Pipeline:
         self._events.publish(VideoUploaded(path=video_file.path, s3_key=duplicate.s3_key))
         self._repo.mark_registered(file_id)
         logger.info(
-            "видео зарегистрировано (дубликат по контенту): %s -> %s",
+            "видео полностью обработано (дубликат по контенту, занятие уже привязано ранее): "
+            "%s -> %s",
             video_file.path,
             duplicate.s3_key,
         )
@@ -356,6 +380,11 @@ class Pipeline:
                 self._repo.mark_failed(file_id, str(exc))
                 attempts += 1
         if attempts == self._max_attempts:
+            logger.error(
+                "видео окончательно не обработано после %d попыток, повторных попыток не будет: %s",
+                attempts,
+                video_file.path,
+            )
             self._events.publish(
                 VideoFailed(path=video_file.path, error=str(exc), attempts=attempts)
             )

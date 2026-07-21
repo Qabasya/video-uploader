@@ -9,6 +9,7 @@ import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Protocol
 
 import uvicorn
 
@@ -31,15 +32,39 @@ from video_uploader.storage.s3_gateway import S3Gateway
 logger = logging.getLogger(__name__)
 
 
-class ScanWorker:
-    """Периодический запуск ``Pipeline.run_cycle()`` в фоновом потоке + внеочередной триггер."""
+class RegistryCounts(Protocol):
+    """Узкий интерфейс реестра, нужный только для сводки в heartbeat-логе."""
 
-    def __init__(self, pipeline: Pipeline, scan_interval_seconds: int) -> None:
+    def count_by_status(self) -> dict[str, int]: ...
+
+
+class ScanWorker:
+    """Периодический запуск ``Pipeline.run_cycle()`` в фоновом потоке + внеочередной триггер.
+
+    Заодно раз в ``heartbeat_interval_seconds`` пишет в лог «сервис жив» со сводкой
+    реестра — единственный сигнал того, что фоновый цикл сканирования не умер молча
+    (см. `.docs/Tasks.md`, доп. правка про краш ``LokiHandler`` — HTTP API мог отвечать
+    ``ok`` даже когда этот поток уже не работал).
+    """
+
+    def __init__(
+        self,
+        pipeline: Pipeline,
+        scan_interval_seconds: int,
+        *,
+        repo: RegistryCounts,
+        heartbeat_interval_seconds: int,
+    ) -> None:
         self._pipeline = pipeline
         self._scan_interval_seconds = scan_interval_seconds
+        self._repo = repo
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self.last_scan_at: datetime | None = None
+        # Не None и не «сейчас минус интервал»: первый heartbeat ждёт полный интервал,
+        # как и первый тик scan/reconcile-циклов в fs-adsync (`_loop`) — единообразно.
+        self._last_heartbeat_at = datetime.now(UTC)
 
     def run(self) -> None:
         """Тело потока: цикл до ``stop()``, прерываемый досрочно через ``request_rescan()``."""
@@ -49,8 +74,17 @@ class ScanWorker:
             except Exception:
                 logger.exception("необработанная ошибка цикла сканирования")
             self.last_scan_at = datetime.now(UTC)
+            self._maybe_heartbeat()
             self._wake_event.wait(timeout=self._scan_interval_seconds)
             self._wake_event.clear()
+
+    def _maybe_heartbeat(self) -> None:
+        now = datetime.now(UTC)
+        elapsed = (now - self._last_heartbeat_at).total_seconds()
+        if elapsed < self._heartbeat_interval_seconds:
+            return
+        self._last_heartbeat_at = now
+        logger.info("сервис жив: реестр=%s", self._repo.count_by_status())
 
     def request_rescan(self) -> None:
         """Будит поток немедленно, не дожидаясь ``SCAN_INTERVAL_SECONDS``."""
@@ -82,8 +116,9 @@ class DryRunS3Gateway:
 class DryRunLmsClient:
     """``DRY_RUN=true``: не трогает сеть, логирует и притворяется успехом."""
 
-    def register(self, payload: dict[str, object]) -> None:
+    def register(self, payload: dict[str, object]) -> bool:
         logger.info("dry-run: register пропущен (успех): s3_key=%s", payload.get("s3_key"))
+        return True
 
     def close(self) -> None:
         pass
@@ -113,6 +148,11 @@ def main() -> None:
     """Точка входа CLI ``video-uploader``."""
     settings = Settings()
     configure_logging(settings)  # до StateRepository — создаёт settings.data_dir попутно
+    logger.info(
+        "fs-video-uploader запускается (dry_run=%s, dry_run_lms_live=%s)",
+        settings.dry_run,
+        settings.dry_run_lms_live,
+    )
     groups_config = load_groups(settings.groups_file)
 
     repo = StateRepository(settings.data_dir / "state.db")
@@ -150,7 +190,12 @@ def main() -> None:
         dry_run=settings.dry_run,
     )
 
-    worker = ScanWorker(pipeline, settings.scan_interval_seconds)
+    worker = ScanWorker(
+        pipeline,
+        settings.scan_interval_seconds,
+        repo=repo,
+        heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
+    )
     worker_thread = threading.Thread(target=worker.run, name="scan-worker")
     worker_thread.start()
 
@@ -162,3 +207,4 @@ def main() -> None:
         worker_thread.join()
         s3.close()
         lms.close()
+        logger.info("fs-video-uploader остановлен")

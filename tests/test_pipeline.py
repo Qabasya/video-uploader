@@ -65,11 +65,13 @@ class FakeLmsClient:
     def __init__(self) -> None:
         self.register_calls: list[dict[str, object]] = []
         self.register_error: Exception | None = None
+        self.register_matched: bool = True
 
-    def register(self, payload: dict[str, object]) -> None:
+    def register(self, payload: dict[str, object]) -> bool:
         if self.register_error is not None:
             raise self.register_error
         self.register_calls.append(payload)
+        return self.register_matched
 
 
 def write_stable_file(path: Path, *, age_minutes: float = 10, content: bytes = b"data") -> None:
@@ -159,7 +161,7 @@ class TestHappyPath:
         assert any("обнаружено" in m for m in info_messages)
         assert any("загружено" in m for m in info_messages)
         assert any("верифицировано" in m for m in info_messages)
-        assert any("зарегистрировано" in m for m in info_messages)
+        assert any("полностью обработано" in m for m in info_messages)
         assert any("архив" in m for m in info_messages)
 
         state = repo.get_by_id(only_record_id(repo))
@@ -378,7 +380,7 @@ class TestRegisterRetryable:
 
 class TestRegisterRejected:
     def test_exhausts_attempts_immediately_without_retry(
-        self, video_root: Path, repo: StateRepository
+        self, video_root: Path, repo: StateRepository, caplog: pytest.LogCaptureFixture
     ) -> None:
         s3 = FakeS3Gateway()
         lms = FakeLmsClient()
@@ -389,17 +391,63 @@ class TestRegisterRejected:
         write_stable_file(video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm")
 
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events, max_attempts=5)
-        pipeline.run_cycle()
+        with caplog.at_level(logging.INFO, logger="video_uploader.pipeline"):
+            pipeline.run_cycle()
 
         state = repo.get_by_id(only_record_id(repo))
         assert state is not None
         assert state.status == "failed"
         assert state.attempts == 5  # сразу исчерпаны, без ретраев
         assert len(failed_events) == 1
+        # регрессия: раньше окончательный отказ никак не логировался отдельной строкой
+        assert any(
+            r.levelname == "ERROR" and "окончательно не обработано" in r.message
+            for r in caplog.records
+        )
 
-        pipeline.run_cycle()  # следующий цикл не должен снова пытаться
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="video_uploader.pipeline"):
+            pipeline.run_cycle()  # следующий цикл не должен снова пытаться
         assert len(s3.upload_calls) == 1
         assert len(failed_events) == 1  # событие не публикуется повторно
+        # регрессия: раньше повторная заливка того же файла проходила молча, без единого лога
+        assert any(
+            r.levelname == "WARNING" and "больше не будет обработано" in r.message
+            for r in caplog.records
+        )
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="video_uploader.pipeline"):
+            pipeline.run_cycle()  # третий цикл — предупреждение не должно повториться
+        assert not any("больше не будет обработано" in r.message for r in caplog.records)
+
+
+class TestUnmatched:
+    def test_registered_but_not_matched_logs_warning_not_success(
+        self, video_root: Path, repo: StateRepository, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        s3 = FakeS3Gateway()
+        lms = FakeLmsClient()
+        lms.register_matched = False
+        events = EventBus()
+        registered_events: list[VideoRegistered] = []
+        events.subscribe(VideoRegistered, registered_events.append)
+        write_stable_file(video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm")
+
+        pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events)
+        with caplog.at_level(logging.INFO, logger="video_uploader.pipeline"):
+            pipeline.run_cycle()
+
+        state = repo.get_by_id(only_record_id(repo))
+        assert state is not None
+        # matched:false — не ошибка сервиса: цикл идёт дальше как обычно (архивация тоже)
+        assert state.status == "archived"
+        assert len(registered_events) == 1  # VideoRegistered публикуется независимо от matched
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any("занятие не найдено" in r.message for r in warnings)
+        info_messages = [r.message for r in caplog.records if r.levelname == "INFO"]
+        assert not any("полностью обработано" in m for m in info_messages)
 
 
 class TestContentDeduplication:
@@ -491,7 +539,7 @@ class TestDryRun:
 
 class TestMaxAttemptsExhausted:
     def test_video_failed_published_once_and_stops_retrying(
-        self, video_root: Path, repo: StateRepository
+        self, video_root: Path, repo: StateRepository, caplog: pytest.LogCaptureFixture
     ) -> None:
         s3 = FakeS3Gateway()
         s3.upload_error = RuntimeError("persistent failure")
@@ -503,8 +551,9 @@ class TestMaxAttemptsExhausted:
 
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events, max_attempts=3)
 
-        for _ in range(3):
-            pipeline.run_cycle()
+        with caplog.at_level(logging.ERROR, logger="video_uploader.pipeline"):
+            for _ in range(3):
+                pipeline.run_cycle()
 
         state = repo.get_by_id(only_record_id(repo))
         assert state is not None
@@ -512,6 +561,9 @@ class TestMaxAttemptsExhausted:
         assert state.attempts == 3
         assert len(failed_events) == 1
         assert len(s3.upload_calls) == 3
+        assert (
+            sum(1 for r in caplog.records if "окончательно не обработано" in r.message) == 1
+        )  # только на цикле, где attempts достиг max_attempts, не раньше
 
         pipeline.run_cycle()  # четвёртый цикл — попыток больше нет
 

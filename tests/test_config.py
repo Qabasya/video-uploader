@@ -30,6 +30,7 @@ class TestDefaults:
         assert settings.stability_minutes == 5
         assert settings.max_attempts == 5
         assert settings.api_port == 8090
+        assert settings.heartbeat_interval_seconds == 3600
         assert settings.skip_older_than_days is None
         assert settings.archive_after_register is True
         assert settings.dry_run is False
@@ -94,6 +95,7 @@ class TestConstraints:
             ("skip_older_than_days", 0),
             ("api_port", 0),
             ("api_port", 70000),
+            ("heartbeat_interval_seconds", 0),
         ],
     )
     def test_out_of_range_rejected(self, field: str, value: int) -> None:

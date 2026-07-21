@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     stability_minutes: int = Field(default=5, ge=1)
     max_attempts: int = Field(default=5, ge=1)
     api_port: int = Field(default=8090, ge=1, le=65535)
+    heartbeat_interval_seconds: int = Field(default=3600, ge=1)
 
     # Опциональные числа
     skip_older_than_days: int | None = Field(default=None, ge=1)

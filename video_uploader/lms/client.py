@@ -3,12 +3,9 @@
 import hashlib
 import hmac
 import json
-import logging
 import time
 
 import httpx
-
-logger = logging.getLogger(__name__)
 
 _TIMEOUT_SECONDS = 30.0
 _ENDPOINT_PATH = "/wp-json/fs-lms/v1/videos"
@@ -44,8 +41,13 @@ class LmsClient:
             transport=transport,
         )
 
-    def register(self, payload: dict[str, object]) -> None:
-        """Один POST-запрос с HMAC-подписью; успех — ``return``, иначе — исключение."""
+    def register(self, payload: dict[str, object]) -> bool:
+        """Один POST-запрос с HMAC-подписью; успех — ``matched``-флаг, иначе исключение.
+
+        ``matched`` — не ошибка, а диагностика: плагин зарегистрировал видео, но не
+        нашёл занятие по дате/времени. Логирует это (с полным контекстом файла)
+        вызывающий код (``pipeline.py``), не этот транспортный слой.
+        """
         raw_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         timestamp = int(time.time())
         headers = {
@@ -60,8 +62,7 @@ class LmsClient:
             raise LmsRetryableError(f"сетевая ошибка LMS: {exc}") from exc
 
         if response.status_code in (200, 201):
-            self._log_match_status(response)
-            return
+            return self._extract_matched(response)
 
         detail = f"LMS {response.status_code}: {response.text[:_RESPONSE_TEXT_LIMIT]}"
         if response.status_code >= 500:
@@ -74,14 +75,15 @@ class LmsClient:
         return hmac.new(self._hmac_secret, message, hashlib.sha256).hexdigest()
 
     @staticmethod
-    def _log_match_status(response: httpx.Response) -> None:
-        """``matched: false`` — не ошибка, но диагностически полезное предупреждение."""
+    def _extract_matched(response: httpx.Response) -> bool:
+        """``False`` только при явном ``matched: false``; иначе — True (в т.ч. пустое тело)."""
         try:
             data = response.json()
         except ValueError:
-            return
+            return True
         if isinstance(data, dict) and data.get("matched") is False:
-            logger.warning("LMS: занятие не найдено по дате/времени, оставлено на ручную привязку")
+            return False
+        return True
 
     def close(self) -> None:
         """Закрывает внутренний ``httpx.Client`` (graceful shutdown)."""
