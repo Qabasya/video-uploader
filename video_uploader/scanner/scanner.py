@@ -28,7 +28,12 @@ class VideoScanner:
         try:
             entries = list(group_dir.iterdir())
         except OSError as exc:
-            logger.warning("не удалось прочитать папку группы %s: %s", group_dir, exc)
+            logger.warning(
+                "не удалось прочитать папку группы %s: %s",
+                group_dir,
+                exc,
+                extra={"event": "group_folder_read_error"},
+            )
             return []
 
         candidates: list[VideoFile] = []

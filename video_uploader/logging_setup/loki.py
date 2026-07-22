@@ -6,6 +6,11 @@
 падение хендлера логирования не должно ронять сервис ни при какой причине сбоя),
 ``response.raise_for_status()``, чтобы 4xx/5xx от самого Loki тоже уходили в
 ``handleError``, а не терялись молча.
+
+Помимо ``service``/``level``/``logger``, при наличии ``record.event`` (передаётся через
+``extra={"event": "..."}`` на вызывающей стороне) добавляется четвёртый лейбл ``event`` —
+низкая кардинальность (десяток-два фиксированных значений), нужен для счётчиков и алертов
+в Grafana без regexp-парсинга текста строки (см. ``.docs/Events-Logging.md``).
 """
 
 import logging
@@ -46,14 +51,18 @@ class LokiHandler(logging.Handler):
                 # потеря ВСЕЙ доставки в Loki до конца жизни процесса хуже, чем
                 # прозрачно пересобрать клиент и продолжить попытки push.
                 self._client = self._build_client()
+            stream_labels: dict[str, str] = {
+                "service": self._service,
+                "level": record.levelname.lower(),
+                "logger": record.name,
+            }
+            event = getattr(record, "event", None)
+            if event is not None:
+                stream_labels["event"] = str(event)
             body = {
                 "streams": [
                     {
-                        "stream": {
-                            "service": self._service,
-                            "level": record.levelname.lower(),
-                            "logger": record.name,
-                        },
+                        "stream": stream_labels,
                         "values": [[str(int(record.created * 1e9)), self.format(record)]],
                     }
                 ]

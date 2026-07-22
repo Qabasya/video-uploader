@@ -76,7 +76,10 @@ class ScanWorker:
             try:
                 self._pipeline.run_cycle()
             except Exception:
-                logger.exception("необработанная ошибка цикла сканирования")
+                logger.exception(
+                    "необработанная ошибка цикла сканирования",
+                    extra={"event": "scan_cycle_error"},
+                )
             self.last_scan_at = datetime.now(UTC)
             self._maybe_heartbeat()
             self._wake_event.wait(timeout=self._scan_interval_seconds)
@@ -88,7 +91,9 @@ class ScanWorker:
         if elapsed < self._heartbeat_interval_seconds:
             return
         self._last_heartbeat_at = now
-        logger.info("сервис жив: реестр=%s", self._repo.count_by_status())
+        logger.info(
+            "сервис жив: реестр=%s", self._repo.count_by_status(), extra={"event": "heartbeat"}
+        )
 
     def request_rescan(self) -> None:
         """Будит поток немедленно, не дожидаясь ``SCAN_INTERVAL_SECONDS``."""
@@ -156,6 +161,7 @@ def main() -> None:
         "fs-video-uploader запускается (dry_run=%s, dry_run_lms_live=%s)",
         settings.dry_run,
         settings.dry_run_lms_live,
+        extra={"event": "service_started"},
     )
     groups_config = load_groups(settings.groups_file)
 
@@ -214,7 +220,11 @@ def main() -> None:
     stop = threading.Event()
 
     def handle_signal(signum: int, _frame: FrameType | None) -> None:
-        logger.info("получен сигнал %s, начинаю остановку", signum)
+        logger.info(
+            "получен сигнал %s, начинаю остановку",
+            signum,
+            extra={"event": "shutdown_signal_received"},
+        )
         stop.set()
         worker.stop()
         server.should_exit = True
@@ -231,4 +241,4 @@ def main() -> None:
 
     s3.close()
     lms.close()
-    logger.info("fs-video-uploader остановлен")
+    logger.info("fs-video-uploader остановлен", extra={"event": "service_stopped"})

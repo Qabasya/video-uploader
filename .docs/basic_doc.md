@@ -307,6 +307,56 @@ LMS_HMAC_SECRET=<секрет, совпадающий с FS_LMS_VIDEO_HMAC_SECRE
 - Реального видео в S3 при этом **нет** (S3-шаг всё ещё заглушка) — плейбэк в LMS не заработает, это ожидаемо: режим 2 проверяет только матчинг/регистрацию, не воспроизведение.
 - Исходный файл остаётся на месте (архивация тоже заглушка, см. таблицу выше) — можно спокойно повторить прогон после правок в `groups.yaml`/расписании занятия.
 
+### 5.8. Метрики и алерты в Grafana (лейбл `event`)
+
+Каждая запись лога, привязанная к значимому шагу пайплайна, несёт четвёртый Loki-лейбл
+`event` (рядом с `service`/`level`/`logger`) — фиксированный набор коротких машинных
+имён, не зависящих от формулировки русского текста. Передаётся на вызывающей стороне
+через `extra={"event": "..."}`, читается `LokiHandler.emit()` (`logging_setup/loki.py`).
+Логи без такой привязки (heartbeat-заглушки dry-run, DEBUG-стабильность и т.п. —
+см. `.docs/Events-Logging.md`) лейбла `event` не несут.
+
+| `event` | Уровень | Что означает | Файл |
+|---|---|---|---|
+| `video_discovered` | INFO | Сканер нашёл новый файл, заведена запись реестра | `pipeline.py` |
+| `video_uploaded` | INFO | Файл загружен и верифицирован в S3 (в т.ч. дубликат по контенту) | `pipeline.py` |
+| `video_verified` | INFO | Прошла верификация объекта в S3 (`head_object`) | `pipeline.py` |
+| `video_registered` | INFO/WARNING | LMS приняла регистрацию — занятие найдено (INFO) или не найдено по дате/времени (WARNING); в т.ч. дубликат по контенту | `pipeline.py` |
+| `video_archived` | INFO | Исходник перемещён в архивную подпапку `_uploaded` | `pipeline.py` |
+| `video_failed` | ERROR | Исчерпаны `MAX_ATTEMPTS`, файл больше не будет обработан | `pipeline.py` |
+| `video_processing_error` | ERROR (exception) | Ошибка на очередной попытке обработки файла (до исчерпания попыток) | `pipeline.py` |
+| `video_attempts_exhausted` | WARNING | Повторное сканирование файла, уже окончательно провалившегося ранее (одноразово на файл) | `pipeline.py` |
+| `video_skipped_old` | INFO | Файл пропущен как старше `SKIP_OLDER_THAN_DAYS` | `pipeline.py` |
+| `group_unmapped` | WARNING | Папка на шаре отсутствует в `groups.yaml` | `pipeline.py` |
+| `date_fallback` | WARNING | Дата занятия не извлечена из имени файла, взят `mtime` | `pipeline.py` |
+| `registry_error` | ERROR (exception) | Не удалось завести/обновить запись в реестре SQLite при обнаружении файла | `pipeline.py` |
+| `group_folder_read_error` | WARNING | Не удалось прочитать папку группы на шаре (`OSError`) | `scanner/scanner.py` |
+| `event_subscriber_error` | ERROR (exception) | Подписчик `EventBus` упал с исключением | `domain/events.py` |
+| `service_started` | INFO | Сервис запущен (лог сразу после `configure_logging`) | `main.py` |
+| `service_stopped` | INFO | Сервис полностью остановился (конец `finally` в `main()`) | `main.py` |
+| `shutdown_signal_received` | INFO | Получен SIGTERM/SIGINT, начат graceful shutdown | `main.py` |
+| `scan_cycle_error` | ERROR (exception) | Необработанная ошибка всего цикла сканирования (не отдельного файла) | `main.py` |
+| `heartbeat` | INFO | Раз в `HEARTBEAT_INTERVAL_SECONDS` — сервис жив, сводка реестра по статусам | `main.py` |
+
+Примеры LogQL-запросов (Grafana → Explore/Dashboard, источник данных Loki):
+
+```logql
+# счётчик загрузок за 5 минут
+sum(count_over_time({service="fs-video-uploader", event="video_uploaded"}[5m]))
+
+# все события, сгруппированные по типу, за час
+sum by (event) (count_over_time({service="fs-video-uploader"}[1h]))
+
+# только ошибки обработки файлов
+{service="fs-video-uploader", event="video_processing_error"}
+```
+
+Кандидаты на алерты (см. также `.docs/Events-Logging.md`):
+
+- `event="video_failed"` (ERROR) — файл окончательно не обработан, нужно вмешательство администратора.
+- `event="group_unmapped"` (WARNING) — на шаре появилась папка без записи в `groups.yaml`.
+- `event="heartbeat"` — **отсутствие** этого события дольше `2 × HEARTBEAT_INTERVAL_SECONDS` (`absent_over_time`) сигнализирует, что фоновый поток сканирования умер молча, при этом `/health` может продолжать отвечать `ok` (см. разбор в `.docs/Tasks.md`).
+
 ### Ключи S3 и интеграция с fs-lms — подробности
 
 `S3_ENDPOINT_URL`/`S3_REGION` уже настроены по умолчанию под Beget (`https://s3.ru1.storage.beget.cloud`, `ru-1`); откуда брать `S3_BUCKET`/`S3_ACCESS_KEY`/`S3_SECRET_KEY`, `LMS_BASE_URL`, `LMS_HMAC_SECRET` и как проверить S3 через `scripts/smoke_s3.py` — см. раздел 5.3–5.6 выше. Полный контракт исходящей регистрации в fs-lms (HMAC-подпись, формат payload, обработка `matched`/ошибок/ретраев) и то, что плагин может прочитать напрямую из S3 (манифест, `x-amz-meta-*`) — `.docs/VU_API.md`.

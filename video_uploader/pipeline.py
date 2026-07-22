@@ -170,11 +170,17 @@ class Pipeline:
                     video_file.mtime,
                 )
             except Exception:
-                logger.exception("не удалось завести запись реестра для %s", video_file.path)
+                logger.exception(
+                    "не удалось завести запись реестра для %s",
+                    video_file.path,
+                    extra={"event": "registry_error"},
+                )
                 continue
 
             if is_new:
-                logger.info("видео обнаружено: %s", video_file.path)
+                logger.info(
+                    "видео обнаружено: %s", video_file.path, extra={"event": "video_discovered"}
+                )
                 self._events.publish(VideoDiscovered(path=video_file.path))
 
             try:
@@ -198,6 +204,7 @@ class Pipeline:
                     "нужно вмешательство администратора: %s",
                     state.attempts,
                     video_file.path,
+                    extra={"event": "video_attempts_exhausted"},
                 )
             return
         if state.status == "registered":
@@ -223,7 +230,11 @@ class Pipeline:
 
         recorded_at, from_fallback = self._extract_date(video_file.path)
         if from_fallback:
-            logger.warning("дата занятия не найдена в имени файла, взят mtime: %s", video_file.path)
+            logger.warning(
+                "дата занятия не найдена в имени файла, взят mtime: %s",
+                video_file.path,
+                extra={"event": "date_fallback"},
+            )
             self._events.publish(DateFallback(path=video_file.path))
 
         if self._skip_older_than_days is not None:
@@ -233,6 +244,7 @@ class Pipeline:
                     "видео пропущено (старше %s дней): %s",
                     self._skip_older_than_days,
                     video_file.path,
+                    extra={"event": "video_skipped_old"},
                 )
                 self._repo.mark_skipped(file_id, "skipped_old")
                 return
@@ -241,7 +253,11 @@ class Pipeline:
         if group_entry is None:
             if video_file.group_folder not in warned_folders:
                 warned_folders.add(video_file.group_folder)
-                logger.warning("папка отсутствует в groups.yaml: %s", video_file.group_folder)
+                logger.warning(
+                    "папка отсутствует в groups.yaml: %s",
+                    video_file.group_folder,
+                    extra={"event": "group_unmapped"},
+                )
                 self._events.publish(GroupUnmapped(group_folder=video_file.group_folder))
             if state.status != "skipped_unmapped":
                 self._repo.mark_skipped(file_id, "skipped_unmapped")
@@ -269,7 +285,12 @@ class Pipeline:
             manifest = _build_manifest(video_file, lesson, sha256, datetime.now(UTC))
             self._s3.put_manifest(self._key_builder.build_manifest_key(s3_key), manifest)
             self._repo.mark_uploaded(file_id, s3_key)
-            logger.info("видео загружено: %s -> %s", video_file.path, s3_key)
+            logger.info(
+                "видео загружено: %s -> %s",
+                video_file.path,
+                s3_key,
+                extra={"event": "video_uploaded"},
+            )
             self._events.publish(VideoUploaded(path=video_file.path, s3_key=s3_key))
         else:
             s3_key = state.s3_key
@@ -283,7 +304,7 @@ class Pipeline:
 
         if not self._s3.verify(s3_key, video_file.size_bytes):
             raise RuntimeError(f"верификация S3 не прошла: {s3_key}")
-        logger.info("видео верифицировано в S3: %s", s3_key)
+        logger.info("видео верифицировано в S3: %s", s3_key, extra={"event": "video_verified"})
 
         if state.status != "registered":
             manifest_key = self._key_builder.build_manifest_key(s3_key)
@@ -297,6 +318,7 @@ class Pipeline:
                     "видео полностью обработано: %s -> %s (занятие найдено)",
                     video_file.path,
                     s3_key,
+                    extra={"event": "video_registered"},
                 )
             else:
                 logger.warning(
@@ -304,6 +326,7 @@ class Pipeline:
                     "нужна ручная привязка: %s -> %s",
                     video_file.path,
                     s3_key,
+                    extra={"event": "video_registered"},
                 )
             self._events.publish(VideoRegistered(path=video_file.path, s3_key=s3_key))
 
@@ -335,7 +358,10 @@ class Pipeline:
             self._repo.mark_uploading(file_id)
         self._repo.mark_uploaded(file_id, duplicate.s3_key)
         logger.info(
-            "видео загружено (дубликат по контенту): %s -> %s", video_file.path, duplicate.s3_key
+            "видео загружено (дубликат по контенту): %s -> %s",
+            video_file.path,
+            duplicate.s3_key,
+            extra={"event": "video_uploaded"},
         )
         self._events.publish(VideoUploaded(path=video_file.path, s3_key=duplicate.s3_key))
         self._repo.mark_registered(file_id)
@@ -344,6 +370,7 @@ class Pipeline:
             "%s -> %s",
             video_file.path,
             duplicate.s3_key,
+            extra={"event": "video_registered"},
         )
         self._events.publish(VideoRegistered(path=video_file.path, s3_key=duplicate.s3_key))
         assert duplicate.sha256 is not None
@@ -364,13 +391,20 @@ class Pipeline:
 
         video_file.path.rename(target)
         self._repo.mark_archived(file_id, target)
-        logger.info("исходник перемещён в архив: %s -> %s", video_file.path, target)
+        logger.info(
+            "исходник перемещён в архив: %s -> %s",
+            video_file.path,
+            target,
+            extra={"event": "video_archived"},
+        )
         self._events.publish(VideoArchived(path=video_file.path, archived_path=target))
 
     def _fail(
         self, file_id: int, video_file: VideoFile, exc: Exception, *, permanent: bool
     ) -> None:
-        logger.exception("ошибка обработки %s", video_file.path)
+        logger.exception(
+            "ошибка обработки %s", video_file.path, extra={"event": "video_processing_error"}
+        )
         self._repo.mark_failed(file_id, str(exc))
         state = self._repo.get_by_id(file_id)
         assert state is not None
@@ -384,6 +418,7 @@ class Pipeline:
                 "видео окончательно не обработано после %d попыток, повторных попыток не будет: %s",
                 attempts,
                 video_file.path,
+                extra={"event": "video_failed"},
             )
             self._events.publish(
                 VideoFailed(path=video_file.path, error=str(exc), attempts=attempts)

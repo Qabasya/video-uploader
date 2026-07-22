@@ -99,4 +99,9 @@ class EventBus:
             try:
                 handler(event)
             except Exception:
-                logger.exception("подписчик %r упал на событии %r", handler, event)
+                logger.exception(
+                    "подписчик %r упал на событии %r",
+                    handler,
+                    event,
+                    extra={"event": "event_subscriber_error"},
+                )
