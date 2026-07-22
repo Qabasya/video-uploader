@@ -1232,47 +1232,47 @@ def create_app(*, repo: StateRepository, worker: ScanWorkerLike) -> FastAPI:
 
 ### Задачи (video-uploader)
 
-- [ ] `domain/events.py`: убрать стаб `EVENT_NAMES = {'': ''}` — по решению 1 словарь не нужен.
-- [ ] `pipeline.py`: добавить `extra={"event": "..."}` (литеральная строка) на все 9 точек логирования
-      рядом с `publish(...)`: `видео обнаружено` (строка ~177 — уже стоит `extra={"event":
-      "video_discovered"}`, оставить как есть), `дата занятия не найдена...` (~226) → `date_fallback`,
-      `папка отсутствует в groups.yaml` (~244) → `group_unmapped`, `видео загружено` (~272) →
-      `video_uploaded`, `видео полностью обработано (занятие найдено)` (~296) → `video_registered`,
-      `видео зарегистрировано, но занятие не найдено` (~302) → `video_registered`, `видео загружено
-      (дубликат...)` (~337) → `video_uploaded`, `видео полностью обработано (дубликат...)` (~342) →
-      `video_registered`, `исходник перемещён в архив` (~367) → `video_archived`, `видео окончательно не
-      обработано после N попыток` (~383) → `video_failed`.
-- [ ] `logging_setup/loki.py`: `emit()` — читать `record.event` через `getattr`, добавлять в `stream`
-      третьим ключом только если он не `None` (см. решение 4). Обновить докстринг модуля/класса, если
-      там упоминается фиксированный набор из трёх лейблов.
-- [ ] Тесты `tests/logging_setup/test_loki.py`: `make_record()` — добавить опциональный параметр
-      `extra: dict[str, object] | None = None`, пробрасывать в `Logger.makeRecord(..., extra)`. Новые
-      тесты: `event` в `stream`, когда `extra={"event": "video_uploaded"}` передан; ключа `event` в
-      `stream` нет, когда `extra` не передан (регресс — старые логи без `extra` не должны обрастать
-      лишним лейблом).
-- [ ] Тесты `tests/test_pipeline.py`: для каждой ветки, публикующей событие (happy path, дубликат,
-      unmatched, `GroupUnmapped`, `DateFallback`, `VideoArchived`, исчерпание попыток) — через `caplog`
-      проверить, что у соответствующей записи `record.event` равен ожидаемой строке из решения 1. Это и
-      есть страховка от рассинхрона строк вместо словаря — тест ловит опечатку так же надёжно.
-- [ ] `CLAUDE.md`, раздел Logging & Notifications: заменить формулировку «Новых Loki-лейблов не
-      заводим...» на описание нового поведения — `event` третьим лейблом для 7 типов доменных событий
-      (список строк — прямо в этом разделе, раз единого источника в коде больше нет), кардинальность
-      ~10 значений, остальные поля (путь, ключ S3, число попыток) по-прежнему только в тексте строки.
-      Явно отметить временное расхождение с `fs-adsync`, пока туда не перенесено эквивалентное решение.
-- [ ] `Events-Logging.md`: отметить советы 3 и 4 как принятые (дата, ссылка на эту правку в `Tasks.md`);
-      при желании обновить пример LogQL-запроса на `{service="fs-video-uploader", event="video_uploaded"}`
-      без `regexp`/`logfmt`-парсинга.
+- [x] `domain/events.py`: стаб `EVENT_NAMES` убран (сделано пользователем); добавлен `extra` на
+      `подписчик %r упал на событии %r` → `event_subscriber_error` (сверх исходного плана — для
+      симметрии с остальными internal-ошибками).
+- [x] `pipeline.py`: `extra={"event": "..."}` добавлен на все 9 точек рядом с `publish(...)`
+      (`video_discovered`/`date_fallback`/`group_unmapped`/`video_uploaded` ×2/`video_registered` ×3/
+      `video_archived`/`video_failed`) **плюс** на 5 внесобытийных логов, нужных для метрик:
+      `registry_error`, `video_attempts_exhausted`, `video_skipped_old`, `video_verified`,
+      `video_processing_error`. Dry-run-заглушки (`_cleanup`) сознательно не затронуты — не несут
+      прод-сигнала.
+- [x] `main.py`: `extra` на `service_started`, `heartbeat`, `scan_cycle_error`,
+      `shutdown_signal_received`, `service_stopped`.
+- [x] `scanner/scanner.py`: `extra={"event": "group_folder_read_error"}` на ошибке чтения папки группы.
+- [x] `logging_setup/loki.py`: `emit()` читает `getattr(record, "event", None)`, кладёт третьим ключом
+      в `stream_labels`, только если не `None`; докстринг модуля дополнен.
+- [ ] Тесты `tests/logging_setup/test_loki.py` (`event` в `stream`/его отсутствие без `extra`) —
+      **не сделаны в этом заходе** (был прямой запрос только на логи, без тестов).
+- [ ] Тесты `tests/test_pipeline.py` (`caplog` на `record.event` по веткам) — **не сделаны**, аналогично.
+- [x] `CLAUDE.md`, раздел Logging & Notifications: формулировка «Новых Loki-лейблов не заводим»
+      заменена на описание `event`-лейбла, кардинальность ~19 значений, ссылка на полный список в
+      `basic_doc.md`.
+- [x] `Events-Logging.md`: советы 3 и 4 отмечены принятыми (дата, ссылка на эту правку и на
+      `basic_doc.md`).
+- [x] `basic_doc.md`: новый раздел 5.8 «Метрики и алерты в Grafana (лейбл `event`)» — таблица всех
+      19 событий (собрана `grep`'ом по фактическому коду, не по плану), примеры LogQL, кандидаты на
+      алерты.
 
 ### Definition of Done (video-uploader)
 
-- [ ] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто.
-- [ ] Ревью Claude.
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 234/234 (без новых тестов на `event` — код не покрыт регрессией на конкретные строки-теги).
+- [x] Ревью Claude — код и документация написаны Claude по прямой просьбе пользователя.
+- [ ] Тесты на `event` — отдельная задача, если понадобится (см. выше).
 - [ ] Коммит — на вашей стороне.
 
 ### Параллельно (отдельная сессия/репозиторий): `fs-adsync`
 
-`fs-adsync` не имеет `EventBus`/доменных событий (реверчено на этапе 8 его `Tasks.md`) — «эквивалентная»
-правка там не копипаста, а отдельное решение (например, свой набор строковых констант `event` при вызовах
-`logger.*`, без доменных классов). Затрагивает его `CLAUDE.md` (тот же пункт «новых лейблов не заводим») и
-`src/logging_setup.py::LokiHandler`. Не делать без отдельного захода в тот репозиторий — здесь только
-зафиксировано, что до этой правки дашборд по `event` в Grafana валиден только для `fs-video-uploader`.
+**Сделано 2026-07-22.** `fs-adsync` не имеет `EventBus`/доменных событий (реверчено на этапе 8 его
+`Tasks.md`) — правка там не копипаста, а отдельное решение: свои строковые `event`-теги при вызовах
+`logger.*` (25 значений — бизнес-исходы заданий/сверки + основная инфраструктура), без доменных
+классов. Затронуты его `CLAUDE.md` (раздел Logging & Notifications), `src/logging_setup.py::LokiHandler`
+(тот же приём — третий лейбл `stream` рядом с `service`/`level`, только при наличии `record.event`),
+`.docs/basic_doc.md` (свой раздел «Метрики и алерты в Grafana») и `.docs/Events-Logging.md` (советы
+3–6 отмечены принятыми). Подробности — его `.docs/Tasks.md`, «Пост-этап 9 — `event`-лейбл Loki-стрима».
+Дашборд по `event` в Grafana теперь валиден для обоих сервисов; тесты на `event` там тоже не добавлены
+в этом заходе (только код + документация, по прямой просьбе).
