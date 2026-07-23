@@ -69,6 +69,9 @@ class ScanWorker:
         # Не None и не «сейчас минус интервал»: первый heartbeat ждёт полный интервал,
         # как и первый тик scan/reconcile-циклов в fs-adsync (`_loop`) — единообразно.
         self._last_heartbeat_at = datetime.now(UTC)
+        # Отдельно от `_last_heartbeat_at` (тот перезаписывается на каждом heartbeat) — момент
+        # старта нужен неизменным для аптайма в Grafana-гейдже (см. `.docs/Tasks.md`).
+        self._started_at = self._last_heartbeat_at
 
     def run(self) -> None:
         """Тело потока: цикл до ``stop()``, прерываемый досрочно через ``request_rescan()``."""
@@ -91,8 +94,12 @@ class ScanWorker:
         if elapsed < self._heartbeat_interval_seconds:
             return
         self._last_heartbeat_at = now
+        uptime_hours = (now - self._started_at).total_seconds() / 3600
         logger.info(
-            "сервис жив: реестр=%s", self._repo.count_by_status(), extra={"event": "heartbeat"}
+            "сервис жив: uptime_hours=%.2f реестр=%s",
+            uptime_hours,
+            self._repo.count_by_status(),
+            extra={"event": "heartbeat"},
         )
 
     def request_rescan(self) -> None:

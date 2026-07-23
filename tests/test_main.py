@@ -1,6 +1,7 @@
 """Тесты ScanWorker и dry-run заглушек: фоновый цикл, rescan-триггер, изоляция ошибок."""
 
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -201,6 +202,7 @@ class TestHeartbeat:
         assert len(heartbeats) >= 1
         assert "registered" in heartbeats[0].message
         assert "failed" in heartbeats[0].message
+        assert re.search(r"uptime_hours=\d+\.\d{2}", heartbeats[0].message)
 
 
 class TestBuildGateways:

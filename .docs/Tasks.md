@@ -1276,3 +1276,46 @@ def create_app(*, repo: StateRepository, worker: ScanWorkerLike) -> FastAPI:
 3–6 отмечены принятыми). Подробности — его `.docs/Tasks.md`, «Пост-этап 9 — `event`-лейбл Loki-стрима».
 Дашборд по `event` в Grafana теперь валиден для обоих сервисов; тесты на `event` там тоже не добавлены
 в этом заходе (только код + документация, по прямой просьбе).
+
+---
+
+## Доп. правка — гейдж «сколько часов сервис жив» в Grafana
+
+**Дата:** 2026-07-23. Первый из набора счётчиков в Grafana, который просит пользователь. Loki-стек
+здесь единственный источник метрик (Prometheus не используется), а тело строки — обычный текст
+(`_LOKI_FORMAT = "%(levelname)s %(name)s: %(message)s"`), без logfmt/JSON — поэтому стандартный
+Prometheus-приём `time() - process_start_time_seconds` не подходит: в LogQL нет функции `time()`.
+Нужно, чтобы сам сервис периодически писал число часов аптайма в текст строки, а Grafana доставала
+его `regexp` + `unwrap`.
+
+### Решения
+
+1. **Без нового события/интервала** — переиспользуем существующий heartbeat (`ScanWorker._maybe_heartbeat`,
+   `main.py`, `event=heartbeat`, период `HEARTBEAT_INTERVAL_SECONDS`, default 3600 c). Обсуждали
+   отдельное более частое событие — отклонено пользователем: часовая точность гейджа «сколько часов
+   сервис жив» достаточна, лишний Loki-стрим и push не оправданы.
+2. **Момент старта** — новое поле `ScanWorker._started_at: datetime`, пишется в `__init__` один раз
+   (`datetime.now(UTC)`), не путать с `_last_heartbeat_at` (тот перезаписывается на каждом heartbeat).
+3. **Формат числа в строке** — фиксированный, легко парсимый токен `uptime_hours=<float>`, не
+   смешивать с уже существующей русской формулировкой сообщения:
+   `"сервис жив: uptime_hours=%.2f реестр=%s", uptime_hours, self._repo.count_by_status()`.
+   Лейбл `event=heartbeat` не меняется — значение просто добавляется в текст.
+
+### Задачи (video-uploader)
+
+- [x] `main.py::ScanWorker.__init__` — добавлен `self._started_at` (алиас начального значения
+      `_last_heartbeat_at`, до первой перезаписи в `_maybe_heartbeat`).
+- [x] `main.py::ScanWorker._maybe_heartbeat` — считает `uptime_hours` и пишет его в лог
+      (`"сервис жив: uptime_hours=%.2f реестр=%s"`).
+- [x] `tests/test_main.py::TestHeartbeat::test_fires_with_registry_counts_when_due` — добавлена
+      проверка `re.search(r"uptime_hours=\d+\.\d{2}", ...)`.
+- [ ] Grafana: панель Gauge, источник Loki (LogQL/настройки панели — переданы пользователю в чате,
+      не дублируются здесь; правка не в этом репозитории, вне DoD).
+- [x] **Написано Claude по прямой просьбе** («допиши код здесь и в AdSync») — не пользователем,
+      отступление от базового формата `[[work-format-user-codes]]`.
+
+### Definition of Done
+
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy video_uploader && uv run pytest` — чисто, 234/234.
+- [x] Ревью Claude (сам автор правки в этот раз).
+- [ ] Коммит — на вашей стороне.
