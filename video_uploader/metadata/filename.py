@@ -6,13 +6,14 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 _DEFAULT_PATTERN = (
-    r"(?P<day>\d{2})_(?P<month>\d{2})_(?P<year>\d{2})"
-    r"_(?P<hour>\d{2})_(?P<minute>\d{2})_(?P<second>\d{2})"
+    r"(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
+    r"_(?P<hour>\d{2})-(?P<minute>\d{2})-(?P<second>\d{2})"
 )
 
 
 class FilenameDateExtractor:
-    """Стратегия: блок ``ДД_ММ_ГГ_ЧЧ_ММ_СС`` (или кастомный DATE_REGEX) в имени файла."""
+    """Стратегия: блок ``ГГГГ-ММ-ДД_ЧЧ-ММ-СС``в имени файла.
+    Важно выставить в OBS пункт 'Формировать имя без пробелов'"""
 
     def __init__(self, tz_name: str, pattern: str | None = None) -> None:
         self._tz = ZoneInfo(tz_name)
@@ -25,11 +26,9 @@ class FilenameDateExtractor:
             return None
 
         groups = match.groupdict()
-        year = self._normalize_year(groups["year"])
-
         try:
             return datetime(
-                year=year,
+                year=int(groups["year"]),
                 month=int(groups["month"]),
                 day=int(groups["day"]),
                 hour=int(groups["hour"]),
@@ -39,10 +38,3 @@ class FilenameDateExtractor:
             )
         except ValueError:
             return None
-
-    @staticmethod
-    def _normalize_year(raw: str) -> int:
-        year = int(raw)
-        if len(raw) == 2:  # ГГ из имени Телемоста -> 20ГГ
-            year += 2000
-        return year

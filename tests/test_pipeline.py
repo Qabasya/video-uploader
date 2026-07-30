@@ -99,7 +99,7 @@ def make_pipeline(
         GroupsConfig.model_validate(groups if groups is not None else GROUPS_YAML)
     )
     return Pipeline(
-        scanner=VideoScanner(video_root=video_root, allowed_extensions=(".webm",)),
+        scanner=VideoScanner(video_root=video_root, allowed_extensions=(".mp4",)),
         stability=StabilityChecker(stability_minutes=5),
         repo=repo,
         date_extractors=[
@@ -149,7 +149,7 @@ class TestHappyPath:
         for event_type in (VideoDiscovered, VideoUploaded, VideoRegistered, VideoArchived):
             events.subscribe(event_type, published.append)
 
-        video_path = video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm"
+        video_path = video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4"
         write_stable_file(video_path)
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events)
 
@@ -168,7 +168,7 @@ class TestHappyPath:
         assert state is not None
         assert state.status == "archived"
         assert not video_path.exists()
-        archived_path = video_root / "КЕГЭ-1" / "_uploaded" / "rec_08_07_26_16_04_45.webm"
+        archived_path = video_root / "КЕГЭ-1" / "_uploaded" / "2026-07-08_16-04-45.mp4"
         assert archived_path.exists()
         assert len(s3.upload_calls) == 1
         assert len(s3.manifest_calls) == 1
@@ -181,7 +181,7 @@ class TestHappyPath:
         ]
 
         _, key, metadata = s3.upload_calls[0]
-        assert key == "videos/kege-1/2026/07/2026-07-08_16-04_" + state.sha256[:8] + ".webm"
+        assert key == "videos/kege-1/2026/07/2026-07-08_16-04_" + state.sha256[:8] + ".mp4"
         assert metadata["group-slug"] == "kege-1"
         assert metadata["lms-group-id"] == "3"
 
@@ -200,7 +200,7 @@ class TestStability:
         events = EventBus()
         discovered: list[VideoDiscovered] = []
         events.subscribe(VideoDiscovered, discovered.append)
-        video_path = video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm"
+        video_path = video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4"
         video_path.parent.mkdir(parents=True)
         video_path.write_bytes(b"data")  # свежий mtime, не состарен
 
@@ -228,7 +228,7 @@ class TestGroupUnmapped:
         unmapped: list[GroupUnmapped] = []
         events.subscribe(GroupUnmapped, unmapped.append)
 
-        for name in ("a_08_07_26_16_04_45.webm", "b_08_07_26_16_04_45.webm"):
+        for name in ("2026-07-08_16-04-45.mp4", "2026-07-08_17-30-00.mp4"):
             write_stable_file(video_root / "НЕИЗВЕСТНАЯ" / name)
 
         pipeline = make_pipeline(
@@ -247,7 +247,7 @@ class TestGroupUnmapped:
         s3 = FakeS3Gateway()
         lms = FakeLmsClient()
         events = EventBus()
-        video_path = video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm"
+        video_path = video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4"
         write_stable_file(video_path)
 
         before = make_pipeline(
@@ -274,7 +274,7 @@ class TestSkipOlderThanDays:
         s3 = FakeS3Gateway()
         lms = FakeLmsClient()
         events = EventBus()
-        video_path = video_root / "КЕГЭ-1" / "rec_01_01_20_10_00_00.webm"  # 2020-01-01
+        video_path = video_root / "КЕГЭ-1" / "2020-01-01_10-00-00.mp4"
         write_stable_file(video_path)
 
         pipeline = make_pipeline(
@@ -300,7 +300,7 @@ class TestDateFallback:
         fallback_events: list[DateFallback] = []
         events.subscribe(DateFallback, fallback_events.append)
 
-        video_path = video_root / "КЕГЭ-1" / "random_name.webm"  # без блока даты
+        video_path = video_root / "КЕГЭ-1" / "random_name.mp4"  # без блока даты
         write_stable_file(video_path)
 
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events)
@@ -311,7 +311,7 @@ class TestDateFallback:
         assert fallback_events[0].path == video_path
         assert len(s3.manifest_calls) == 1
         assert "recorded_at" in s3.manifest_calls[0][1]
-        assert "random_name.webm" in caplog.text
+        assert "random_name.mp4" in caplog.text
         assert any(record.levelname == "WARNING" for record in caplog.records)
 
 
@@ -321,7 +321,7 @@ class TestUploadFailure:
         s3.upload_error = RuntimeError("boto3 boom")
         lms = FakeLmsClient()
         events = EventBus()
-        write_stable_file(video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm")
+        write_stable_file(video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4")
 
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events)
         pipeline.run_cycle()
@@ -339,7 +339,7 @@ class TestVerifyFailure:
         s3.verify_result = False
         lms = FakeLmsClient()
         events = EventBus()
-        write_stable_file(video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm")
+        write_stable_file(video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4")
 
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events)
         pipeline.run_cycle()
@@ -357,7 +357,7 @@ class TestRegisterRetryable:
         lms = FakeLmsClient()
         lms.register_error = LmsRetryableError("503")
         events = EventBus()
-        write_stable_file(video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm")
+        write_stable_file(video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4")
 
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events, max_attempts=5)
         pipeline.run_cycle()
@@ -388,7 +388,7 @@ class TestRegisterRejected:
         events = EventBus()
         failed_events: list[VideoFailed] = []
         events.subscribe(VideoFailed, failed_events.append)
-        write_stable_file(video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm")
+        write_stable_file(video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4")
 
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events, max_attempts=5)
         with caplog.at_level(logging.INFO, logger="video_uploader.pipeline"):
@@ -432,7 +432,7 @@ class TestUnmatched:
         events = EventBus()
         registered_events: list[VideoRegistered] = []
         events.subscribe(VideoRegistered, registered_events.append)
-        write_stable_file(video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm")
+        write_stable_file(video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4")
 
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events)
         with caplog.at_level(logging.INFO, logger="video_uploader.pipeline"):
@@ -458,8 +458,8 @@ class TestContentDeduplication:
         lms = FakeLmsClient()
         events = EventBus()
         content = b"identical bytes"
-        write_stable_file(video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm", content=content)
-        write_stable_file(video_root / "КЕГЭ-1" / "rec_09_07_26_16_04_45.webm", content=content)
+        write_stable_file(video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4", content=content)
+        write_stable_file(video_root / "КЕГЭ-1" / "2026-07-09_16-04-45.mp4", content=content)
 
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events)
         pipeline.run_cycle()
@@ -479,7 +479,7 @@ class TestResumeFromUploading:
         s3 = FakeS3Gateway()
         lms = FakeLmsClient()
         events = EventBus()
-        video_path = video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm"
+        video_path = video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4"
         write_stable_file(video_path)
 
         file_id, _ = repo.discover(
@@ -502,7 +502,7 @@ class TestArchiveAfterRegisterDisabled:
         events = EventBus()
         archived_events: list[VideoArchived] = []
         events.subscribe(VideoArchived, archived_events.append)
-        video_path = video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm"
+        video_path = video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4"
         write_stable_file(video_path)
 
         pipeline = make_pipeline(
@@ -524,7 +524,7 @@ class TestDryRun:
         events = EventBus()
         archived_events: list[VideoArchived] = []
         events.subscribe(VideoArchived, archived_events.append)
-        video_path = video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm"
+        video_path = video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4"
         write_stable_file(video_path)
 
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events, dry_run=True)
@@ -547,7 +547,7 @@ class TestMaxAttemptsExhausted:
         events = EventBus()
         failed_events: list[VideoFailed] = []
         events.subscribe(VideoFailed, failed_events.append)
-        write_stable_file(video_root / "КЕГЭ-1" / "rec_08_07_26_16_04_45.webm")
+        write_stable_file(video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4")
 
         pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=events, max_attempts=3)
 
