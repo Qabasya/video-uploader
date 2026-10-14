@@ -311,6 +311,9 @@ class Pipeline:
             payload = _build_lms_payload(
                 self._bucket, s3_key, manifest_key, lesson, video_file, sha256
             )
+            if self._dry_run:
+                # LMS проверяет матчинг без записи в реестр и изменения занятия.
+                payload["dry_run"] = True
             matched = self._lms.register(payload)
             self._repo.mark_registered(file_id)
             if matched:

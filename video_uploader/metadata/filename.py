@@ -1,4 +1,4 @@
-"""Дата из имени файла по ``DATE_REGEX`` (default — записи Телемоста)."""
+"""Дата из имени файла по ``DATE_REGEX`` (default — записи OBS)."""
 
 import re
 from datetime import datetime

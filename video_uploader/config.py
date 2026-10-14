@@ -67,6 +67,25 @@ class Settings(BaseSettings):
     # Расширения файлов
     allowed_extensions: Annotated[tuple[str, ...], NoDecode] = (".webm", ".mp4", ".mkv")
 
+    @model_validator(mode="after")
+    def _check_live_credentials(self) -> Self:
+        if not self.dry_run:
+            required = {
+                "S3_BUCKET": self.s3_bucket,
+                "S3_ACCESS_KEY": self.s3_access_key,
+                "S3_SECRET_KEY": self.s3_secret_key.get_secret_value(),
+                "LMS_BASE_URL": self.lms_base_url,
+                "LMS_HMAC_SECRET": self.lms_hmac_secret.get_secret_value(),
+            }
+            empty = [key for key, value in required.items() if not value.strip()]
+            if empty:
+                raise ValueError("Рабочий режим: не заполнены " + ", ".join(empty))
+        elif self.dry_run_lms_live and (
+            not self.lms_base_url.strip() or not self.lms_hmac_secret.get_secret_value().strip()
+        ):
+            raise ValueError("Проверка LMS: нужны LMS_BASE_URL и LMS_HMAC_SECRET")
+        return self
+
     @field_validator(
         "skip_older_than_days",
         "loki_url",

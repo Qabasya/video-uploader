@@ -224,3 +224,40 @@ class TestBuildGateways:
         settings = make_settings(dry_run=True, dry_run_lms_live=True)
         assert isinstance(_build_s3_gateway(settings), DryRunS3Gateway)
         assert isinstance(_build_lms_client(settings), LmsClient)
+
+
+class TestDryRunStateIsolation:
+    def test_switch_to_live_uploads_files_seen_in_dry_run(self, tmp_path: Path) -> None:
+        from tests.test_pipeline import (
+            FakeLmsClient,
+            FakeS3Gateway,
+            make_pipeline,
+            write_stable_file,
+        )
+        from video_uploader.domain.events import EventBus
+        from video_uploader.main import _state_db_path
+        from video_uploader.state.repository import StateRepository
+
+        root = tmp_path / "video"
+        path = root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4"
+        write_stable_file(path)
+        dry_settings = make_settings(data_dir=tmp_path, dry_run=True)
+        live_settings = make_settings(data_dir=tmp_path, dry_run=False)
+        dry_repo = StateRepository(_state_db_path(dry_settings))
+        dry_pipeline = make_pipeline(
+            root,
+            dry_repo,
+            s3=DryRunS3Gateway(),
+            lms=DryRunLmsClient(),
+            events=EventBus(),
+            dry_run=True,
+        )
+        dry_pipeline.run_cycle()
+        assert path.exists()
+        live_repo = StateRepository(_state_db_path(live_settings))
+        s3 = FakeS3Gateway()
+        lms = FakeLmsClient()
+        make_pipeline(root, live_repo, s3=s3, lms=lms, events=EventBus()).run_cycle()
+        assert len(s3.upload_calls) == 1
+        assert len(lms.register_calls) == 1
+        assert live_repo.get_recent(1)[0].status == "archived"

@@ -160,6 +160,12 @@ def _build_lms_client(settings: Settings) -> DryRunLmsClient | LmsClient:
     return LmsClient(settings.lms_base_url, settings.lms_hmac_secret.get_secret_value())
 
 
+def _state_db_path(settings: Settings) -> Path:
+    """Сухой прогон не должен отмечать рабочие файлы как уже загруженные."""
+    name = "state.dry-run.db" if settings.dry_run else "state.db"
+    return settings.data_dir / name
+
+
 def main() -> None:
     """Точка входа CLI ``video-uploader``."""
     settings = Settings()
@@ -172,7 +178,7 @@ def main() -> None:
     )
     groups_config = load_groups(settings.groups_file)
 
-    repo = StateRepository(settings.data_dir / "state.db")
+    repo = StateRepository(_state_db_path(settings))
     events = EventBus()
 
     scanner = VideoScanner(

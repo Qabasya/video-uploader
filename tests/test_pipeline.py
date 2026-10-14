@@ -569,3 +569,13 @@ class TestMaxAttemptsExhausted:
 
         assert len(s3.upload_calls) == 3  # не выросло
         assert len(failed_events) == 1  # событие не повторилось
+
+
+class TestDryRunRegistrationPreview:
+    def test_dry_run_sends_preview_flag(self, video_root: Path, repo: StateRepository) -> None:
+        s3 = FakeS3Gateway()
+        lms = FakeLmsClient()
+        write_stable_file(video_root / "КЕГЭ-1" / "2026-07-08_16-04-45.mp4")
+        pipeline = make_pipeline(video_root, repo, s3=s3, lms=lms, events=EventBus(), dry_run=True)
+        pipeline.run_cycle()
+        assert lms.register_calls[0]["dry_run"] is True

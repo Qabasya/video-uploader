@@ -149,3 +149,18 @@ class TestSecrets:
 
     def test_secret_value_accessible(self) -> None:
         assert make_settings().s3_secret_key.get_secret_value() == "top-secret"
+
+
+class TestLiveCredentials:
+    @pytest.mark.parametrize("field", list(REQUIRED))
+    def test_blank_live_credentials_are_rejected(self, field: str) -> None:
+        with pytest.raises(ValidationError, match="Рабочий режим"):
+            make_settings(**{field: " "})
+
+    def test_offline_dry_run_allows_empty_s3_credentials(self) -> None:
+        settings = make_settings(dry_run=True, s3_access_key="", s3_secret_key="")
+        assert settings.dry_run
+
+    def test_live_preview_requires_hmac(self) -> None:
+        with pytest.raises(ValidationError, match="Проверка LMS"):
+            make_settings(dry_run=True, dry_run_lms_live=True, lms_hmac_secret="")
