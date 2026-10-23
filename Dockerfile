@@ -14,6 +14,11 @@ RUN uv sync --frozen --no-dev
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 WORKDIR /app
 
+# ffmpeg — перепаковка mp4 с moov в начало файла (faststart) перед загрузкой.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --gid 1000 appuser \
     && useradd --uid 1000 --gid appuser --create-home --shell /usr/sbin/nologin appuser
 

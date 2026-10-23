@@ -156,3 +156,50 @@ class TestVerify:
         gateway = make_gateway()
         fake_client.head_object_response = {"ContentLength": 99}
         assert gateway.verify("videos/kege-1/rec.webm", expected_size=100) is False
+
+
+class TestFaststartIntegration:
+    def test_cache_control_always_set(self, fake_client: FakeBotoClient, tmp_path: Path) -> None:
+        video_path = tmp_path / "rec.webm"
+        video_path.write_bytes(b"data")
+
+        make_gateway().upload_video(video_path, "videos/k/rec.webm", metadata={})
+
+        assert "max-age" in fake_client.upload_file_calls[0]["ExtraArgs"]["CacheControl"]
+
+    def test_remuxed_upload_uses_copy_and_records_source_size(
+        self, fake_client: FakeBotoClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from contextlib import contextmanager
+
+        from video_uploader.storage import s3_gateway
+
+        copy = tmp_path / "copy.mp4"
+        copy.write_bytes(b"c")
+
+        @contextmanager
+        def fake_copy(path: Path, work_dir: Path):  # type: ignore[no-untyped-def]
+            yield copy
+
+        monkeypatch.setattr(s3_gateway, "faststart_copy", fake_copy)
+        source = tmp_path / "rec.mp4"
+        source.write_bytes(b"source-data")
+        gateway = S3Gateway(
+            endpoint_url="https://s3", region="ru-1", bucket="b",
+            access_key="k", secret_key="s", remux_dir=tmp_path / "w",
+        )  # fmt: skip
+
+        gateway.upload_video(source, "videos/k/rec.mp4", metadata={})
+
+        call = fake_client.upload_file_calls[0]
+        assert call["Filename"] == str(copy)
+        assert call["ExtraArgs"]["Metadata"] == {"remuxed-from-size": "11"}
+
+    def test_verify_accepts_remuxed_object(self, fake_client: FakeBotoClient) -> None:
+        fake_client.head_object_response = {
+            "ContentLength": 99,
+            "Metadata": {"remuxed-from-size": "11"},
+        }
+        gateway = make_gateway()
+        assert gateway.verify("k", 11) is True
+        assert gateway.verify("k", 12) is False

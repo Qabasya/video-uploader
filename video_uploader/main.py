@@ -150,6 +150,7 @@ def _build_s3_gateway(settings: Settings) -> DryRunS3Gateway | S3Gateway:
         bucket=settings.s3_bucket,
         access_key=settings.s3_access_key,
         secret_key=settings.s3_secret_key.get_secret_value(),
+        remux_dir=settings.data_dir / "remux",
     )
 
 
