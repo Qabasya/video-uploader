@@ -203,3 +203,11 @@ class TestFaststartIntegration:
         gateway = make_gateway()
         assert gateway.verify("k", 11) is True
         assert gateway.verify("k", 12) is False
+
+    def test_verify_accepts_capitalized_metadata_keys(self, fake_client: FakeBotoClient) -> None:
+        fake_client.head_object_response = {
+            "ContentLength": 99,
+            "Metadata": {"Remuxed-From-Size": "11"},
+        }
+        gateway = make_gateway()
+        assert gateway.verify("k", 11) is True

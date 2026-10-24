@@ -102,7 +102,9 @@ class S3Gateway:
         length = int(response["ContentLength"])
         if length == expected_size:
             return True
-        source_size = (response.get("Metadata") or {}).get(_REMUX_SOURCE_SIZE_KEY)
+        # Beget возвращает ключи metadata с заглавной буквы (Remuxed-From-Size).
+        metadata = {k.lower(): v for k, v in (response.get("Metadata") or {}).items()}
+        source_size = metadata.get(_REMUX_SOURCE_SIZE_KEY)
         return source_size == str(expected_size) and length > 0
 
     def close(self) -> None:
